@@ -157,6 +157,7 @@ def _autoload():
 
     import torch  # noqa: E402
     from . import _hooks  # noqa: F401
+    import spyre_ccl  # noqa: F401
 
     # Set all the appropriate state on PyTorch
     torch.utils.rename_privateuse1_backend(DEVICE_NAME)

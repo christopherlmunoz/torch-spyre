@@ -33,6 +33,7 @@ from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 PATH_NAME = "torch_spyre"
 PACKAGE_NAME = "torch_spyre"
+DISTRIBUTED_PACKAGE_NAME = "spyre_ccl"
 
 
 def get_torch_spyre_version() -> str:
@@ -57,6 +58,7 @@ def check_libflex():
 ROOT_DIR = Path(__file__).absolute().parent
 CODEGEN_DIR = ROOT_DIR / "codegen"
 CSRC_DIR = ROOT_DIR / PATH_NAME / "csrc"
+DISTRIBUTED_SRC_DIR = CSRC_DIR / "distributed"
 
 
 # Automatically download json.hpp if not present
@@ -186,6 +188,7 @@ if __name__ == "__main__":
     sources = list(CSRC_DIR.glob("*.cpp"))
     if OUTPUT_CODEGEN_DIR:
         sources += list(OUTPUT_CODEGEN_DIR.glob("*.cpp"))
+    distributed_sources = list(DISTRIBUTED_SRC_DIR.glob("*.cpp"))
 
     # Filenames that belong to the tiny hooks module
     hook_files = {"spyre_hooks.cpp"}
@@ -196,6 +199,9 @@ if __name__ == "__main__":
     ]
     core_src_paths = [
         p.relative_to(ROOT_DIR).as_posix() for p in sorted(core_src_paths)
+    ]
+    distributed_src_paths = [
+        p.relative_to(ROOT_DIR).as_posix() for p in sorted(distributed_sources)
     ]
 
     ext_modules = [
@@ -225,6 +231,22 @@ if __name__ == "__main__":
             define_macros=[
                 ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
                 ("MODULE_NAME", f'"{PACKAGE_NAME}._hooks"'),
+                ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
+                ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
+                ("EAGER_MODE_ENV", '"EAGER_MODE"'),
+                ("BOOST_ALL_DYN_LINK", None),  # avoid static link to boost
+            ],
+        ),
+        CppExtension(
+            name=f"{DISTRIBUTED_PACKAGE_NAME}",
+            sources=distributed_src_paths,
+            include_dirs=[str(p) for p in INCLUDE_DIRS],
+            library_dirs=[str(p) for p in LIBRARY_DIRS],
+            libraries=LIBRARIES,
+            extra_compile_args={"cxx": EXTRA_CXX_FLAGS},
+            define_macros=[
+                ("PACKAGE_NAME", f'"{PACKAGE_NAME}"'),
+                ("MODULE_NAME", f'"{DISTRIBUTED_PACKAGE_NAME}"'),
                 ("SPYRE_DEBUG_ENV", '"TORCH_SPYRE_DEBUG"'),
                 ("SPYRE_DOWNCAST_ENV", '"TORCH_SPYRE_DOWNCAST_WARN"'),
                 ("EAGER_MODE_ENV", '"EAGER_MODE"'),
