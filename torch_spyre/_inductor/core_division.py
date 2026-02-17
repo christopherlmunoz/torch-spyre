@@ -157,36 +157,37 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             cd[split_idx] = num_cores
 
 
-def get_op_dim_size(layout: FixedTiledLayout, op_dim_idx: int) -> int:
+def get_host_dim_size(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     """
-    Get the size of an operation dimension from a tensor's host layout.
+    Get the size of an operation dimension from a tensor's host dimensions.
 
     Args:
         layout: The tensor's FixedTiledLayout
-        op_dim_idx: The operation dimension index (before canonicalization)
+        host_dim_idx: The host dimension index (before canonicalization)
 
     Returns:
-        The size of the operation dimension
+        The size of the operation dimension or number of sticks if it's
+        the stick dimension
     """
     # layout.size is host size before canonicalization
-    assert op_dim_idx < len(layout.size)
+    assert host_dim_idx < len(layout.size)
 
-    if op_dim_idx != -1 and op_dim_idx != len(layout.size) - 1:
-        return int(layout.size[op_dim_idx])
+    if host_dim_idx != -1 and host_dim_idx != len(layout.size) - 1:
+        return int(layout.size[host_dim_idx])
     else:  # stick dim
         return (
-            int(layout.size[op_dim_idx])
+            int(layout.size[host_dim_idx])
             // layout.device_layout.device_dtype.elems_per_stick()
         )
 
 
-def map_op_dim_to_device_dim(layout: FixedTiledLayout, op_dim_idx: int) -> int:
+def map_host_dim_to_device_dim(layout: FixedTiledLayout, host_dim_idx: int) -> int:
     """
-    Map an operation dimension to its corresponding device dimension(s).
+    Map a tensor host dimension index to its corresponding device dimension(s).
 
     Args:
         layout: The tensor's FixedTiledLayout
-        op_dim_idx: The operation dimension index
+        host_dim_idx:  The host dimension index (before canonicalization)
 
     Returns:
         The device dimension index that correspond to this operation dimension
@@ -195,7 +196,7 @@ def map_op_dim_to_device_dim(layout: FixedTiledLayout, op_dim_idx: int) -> int:
     #   1. device layout is generic stick, so the last element is not considered
     #   2. dim_map elements have unique values
     dim_map = layout.device_layout.dim_map[:-1]
-    return dim_map.index(op_dim_idx)
+    return dim_map.index(host_dim_idx)
 
 
 def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
@@ -214,8 +215,8 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # Operation dimension indices: M=0, K=1, N=2
 
         # Get operation dimension sizes from host layouts
-        M = get_op_dim_size(args[0].layout, 0)
-        N = get_op_dim_size(args[1].layout, 1)
+        M = get_host_dim_size(args[0].layout, 0)
+        N = get_host_dim_size(args[1].layout, 1)
 
         # Parallelizable operation dimensions: M and N (not K, the reduction dim)
         sizes = [M, N]
@@ -231,17 +232,17 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # Safe to assume the dimension is not canonicalized if nsplit > 1, thus it must be mapped to an existing
         # device dim
         if op_dim_splits["M"] > 1:
-            n.spyre_core_division[0][map_op_dim_to_device_dim(args[0].layout, 0)] = (
+            n.spyre_core_division[0][map_host_dim_to_device_dim(args[0].layout, 0)] = (
                 op_dim_splits["M"]
             )
-            n.spyre_core_division[2][map_op_dim_to_device_dim(output, 1)] = (
+            n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = (
                 op_dim_splits["M"]
             )
         if op_dim_splits["N"] > 1:
-            n.spyre_core_division[1][map_op_dim_to_device_dim(args[1].layout, 2)] = (
+            n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 2)] = (
                 op_dim_splits["N"]
             )
-            n.spyre_core_division[2][map_op_dim_to_device_dim(output, 2)] = (
+            n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = (
                 op_dim_splits["N"]
             )
 
@@ -258,9 +259,9 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # output host layout: [B, M, N]
 
             # Get operation dimension sizes from host layouts
-            B = get_op_dim_size(args[0].layout, 0)
-            M = get_op_dim_size(args[0].layout, 1)
-            N = get_op_dim_size(args[1].layout, 2)
+            B = get_host_dim_size(args[0].layout, 0)
+            M = get_host_dim_size(args[0].layout, 1)
+            N = get_host_dim_size(args[1].layout, 2)
 
             # Parallelizable operation dimensions: B, M, N (not K, the reduction dim)
             sizes = [B, M, N]
@@ -279,34 +280,34 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # arg0: [B, M, K] - B is host dim 0, M is host dim 1, K is host dim 2
             if op_dim_splits["B"] > 1:
                 n.spyre_core_division[0][
-                    map_op_dim_to_device_dim(args[0].layout, 0)
+                    map_host_dim_to_device_dim(args[0].layout, 0)
                 ] = op_dim_splits["B"]
             if op_dim_splits["M"] > 1:
                 n.spyre_core_division[0][
-                    map_op_dim_to_device_dim(args[0].layout, 1)
+                    map_host_dim_to_device_dim(args[0].layout, 1)
                 ] = op_dim_splits["M"]
 
             # arg1: [B, K, N] - B is host dim 0, K is host dim 1, N is host dim 2
             if op_dim_splits["B"] > 1:
                 n.spyre_core_division[1][
-                    map_op_dim_to_device_dim(args[1].layout, 0)
+                    map_host_dim_to_device_dim(args[1].layout, 0)
                 ] = op_dim_splits["B"]
             if op_dim_splits["N"] > 1:
                 n.spyre_core_division[1][
-                    map_op_dim_to_device_dim(args[1].layout, 2)
+                    map_host_dim_to_device_dim(args[1].layout, 2)
                 ] = op_dim_splits["N"]
 
             # output: [B, M, N] - B is host dim 0, M is host dim 1, N is host dim 2
             if op_dim_splits["B"] > 1:
-                n.spyre_core_division[2][map_op_dim_to_device_dim(output, 0)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = (
                     op_dim_splits["B"]
                 )
             if op_dim_splits["M"] > 1:
-                n.spyre_core_division[2][map_op_dim_to_device_dim(output, 1)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = (
                     op_dim_splits["M"]
                 )
             if op_dim_splits["N"] > 1:
-                n.spyre_core_division[2][map_op_dim_to_device_dim(output, 2)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = (
                     op_dim_splits["N"]
                 )
 
@@ -317,10 +318,10 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # output host layout: [B1, B2, M, N]
 
             # Get operation dimension sizes from host layouts
-            B1 = get_op_dim_size(args[0].layout, 0)
-            B2 = get_op_dim_size(args[0].layout, 1)
-            M = get_op_dim_size(args[0].layout, 2)
-            N = get_op_dim_size(args[1].layout, 3)
+            B1 = get_host_dim_size(args[0].layout, 0)
+            B2 = get_host_dim_size(args[0].layout, 1)
+            M = get_host_dim_size(args[0].layout, 2)
+            N = get_host_dim_size(args[1].layout, 3)
 
             # Parallelizable operation dimensions: B1, B2, M, N (not K, the reduction dim)
             sizes = [B1, B2, M, N]
@@ -344,46 +345,46 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # arg0: [B1, B2, M, K] - B1 is host dim 0, B2 is host dim 1, M is host dim 2, K is host dim 3
             if op_dim_splits["B1"] > 1:
                 n.spyre_core_division[0][
-                    map_op_dim_to_device_dim(args[0].layout, 0)
+                    map_host_dim_to_device_dim(args[0].layout, 0)
                 ] = op_dim_splits["B1"]
             if op_dim_splits["B2"] > 1:
                 n.spyre_core_division[0][
-                    map_op_dim_to_device_dim(args[0].layout, 1)
+                    map_host_dim_to_device_dim(args[0].layout, 1)
                 ] = op_dim_splits["B2"]
             if op_dim_splits["M"] > 1:
                 n.spyre_core_division[0][
-                    map_op_dim_to_device_dim(args[0].layout, 2)
+                    map_host_dim_to_device_dim(args[0].layout, 2)
                 ] = op_dim_splits["M"]
 
             # arg1: [B1, B2, K, N] - B1 is host dim 0, B2 is host dim 1, K is host dim 2, N is host dim 3
             if op_dim_splits["B1"] > 1:
                 n.spyre_core_division[1][
-                    map_op_dim_to_device_dim(args[1].layout, 0)
+                    map_host_dim_to_device_dim(args[1].layout, 0)
                 ] = op_dim_splits["B1"]
             if op_dim_splits["B2"] > 1:
                 n.spyre_core_division[1][
-                    map_op_dim_to_device_dim(args[1].layout, 1)
+                    map_host_dim_to_device_dim(args[1].layout, 1)
                 ] = op_dim_splits["B2"]
             if op_dim_splits["N"] > 1:
                 n.spyre_core_division[1][
-                    map_op_dim_to_device_dim(args[1].layout, 3)
+                    map_host_dim_to_device_dim(args[1].layout, 3)
                 ] = op_dim_splits["N"]
 
             # output: [B1, B2, M, N] - B1 is host dim 0, B2 is host dim 1, M is host dim 2, N is host dim 3
             if op_dim_splits["B1"] > 1:
-                n.spyre_core_division[2][map_op_dim_to_device_dim(output, 0)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 0)] = (
                     op_dim_splits["B1"]
                 )
             if op_dim_splits["B2"] > 1:
-                n.spyre_core_division[2][map_op_dim_to_device_dim(output, 1)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = (
                     op_dim_splits["B2"]
                 )
             if op_dim_splits["M"] > 1:
-                n.spyre_core_division[2][map_op_dim_to_device_dim(output, 2)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = (
                     op_dim_splits["M"]
                 )
             if op_dim_splits["N"] > 1:
-                n.spyre_core_division[2][map_op_dim_to_device_dim(output, 3)] = (
+                n.spyre_core_division[2][map_host_dim_to_device_dim(output, 3)] = (
                     op_dim_splits["N"]
                 )
 

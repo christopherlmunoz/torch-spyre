@@ -988,7 +988,13 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         if "core_division" in kwargs["op_info"]:
             core_div = kwargs["op_info"]["core_division"][-1]  # output core division
             for i, nsplit in enumerate(core_div[:-1]):  # exclude the last device dim
-                dim_splits[outputs[0]["device_layout"].dim_map[i]] = nsplit
+                if nsplit > 1:
+                    host_dim = outputs[0]["device_layout"].dim_map[i]
+                    map_host_dim_to_op_dim = [
+                        0,
+                        2,
+                    ]  # map output host dim to operation dim
+                    dim_splits[map_host_dim_to_op_dim[host_dim]] = nsplit
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
@@ -1015,7 +1021,7 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
     This is a thin wrapper around _generate_matmul_common that provides
     bmm-specific configuration (4D dimensions with batch, specific layouts).
     """
-    d3 = len(dimensions) == 4
+    d3 = len(outputs[0]["host_size"]) == 3
     if d3:
         dim_labels = ["x", "mb", "in", "out"]
     else:
@@ -1032,7 +1038,10 @@ def generate_bmm(pointers, *, op, dimensions, inputs, outputs, **kwargs):
         if "core_division" in kwargs["op_info"]:
             core_div = kwargs["op_info"]["core_division"][-1]  # output core division
             for i, nsplit in enumerate(core_div[:-1]):  # exclude the last device dim
-                dim_splits[outputs[0]["device_layout"].dim_map[i]] = nsplit
+                if nsplit > 1:
+                    host_dim = outputs[0]["device_layout"].dim_map[i]
+                    map_host_dim_to_op_dim = [0, 1, 3] if d3 else [0, 1, 2, 4]
+                    dim_splits[map_host_dim_to_op_dim[host_dim]] = nsplit
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
