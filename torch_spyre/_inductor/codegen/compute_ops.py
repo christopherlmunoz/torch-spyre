@@ -987,11 +987,8 @@ def generate_matmul(pointers, *, op, dimensions, inputs, outputs, **kwargs):
 
         if "core_division" in kwargs["op_info"]:
             core_div = kwargs["op_info"]["core_division"][-1]  # output core division
-            dim_splits = [
-                core_div[1],  # mb_split
-                1,  # in_split
-                core_div[0],  # out_split
-            ]
+            for i, nsplit in enumerate(core_div[:-1]):  # exclude the last device dim
+                dim_splits[outputs[0]["device_layout"].dim_map[i]] = nsplit
 
     coreid_to_wk_slice = calculate_core_to_slice_mapping(dim_labels, dim_splits)
 
