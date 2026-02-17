@@ -106,9 +106,9 @@
   template_name: view
 - operator_name: tanh
   template_name: base
-- operator_name: transpose
-  template_name: view
-  out_shape_stride_expr: transpose
+# - operator_name: transpose
+#   template_name: view
+#   out_shape_stride_expr: transpose
 - operator_name: tril
   template_name: base
 - operator_name: _unsafe_view

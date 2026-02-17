@@ -17,6 +17,12 @@ import torch_spyre.fallbacks  # noqa: F401
 from typing import Union
 
 
+def maybe_wrap_dim(dim, ndims):
+    if dim < 0:
+        return dim + ndims
+    return dim
+
+
 @torch.library.register_kernel("aten::mm", ["spyre"])
 def spyre__mm(self: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
     compiled_mm = torch.compile(torch.mm, dynamic=False)
@@ -38,6 +44,37 @@ def spyre__fill_scalar(
     tmp = torch.ones(self.size(), dtype=self.dtype) * other
     self.copy_(tmp)
     return self
+
+
+@torch.library.register_kernel("aten::transpose.int", ["spyre"])
+def spyre__transpose_int(self: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
+    ndims = self.dim()
+    dim0 = maybe_wrap_dim(dim0, ndims)
+    dim1 = maybe_wrap_dim(dim1, ndims)
+
+    # Transpose of a tensor is a view operation.
+    if dim0 == dim1:
+        return torch.ops.aten.alias(self)
+
+    sizes = list(self.shape)
+    sizes[dim0], sizes[dim1] = sizes[dim1], sizes[dim0]
+    strides = list(self.stride())
+    strides[dim0], strides[dim1] = strides[dim1], strides[dim0]
+    prev_stl = self.device_tensor_layout()
+    dim_map = prev_stl.dim_map
+    for idx, dim in enumerate(dim_map):
+        if dim == dim0:
+            dim_map[idx] = dim1
+        elif dim == dim1:
+            dim_map[idx] = dim0
+    new_stl = torch_spyre._C.SpyreTensorLayout(
+        prev_stl.device_size, dim_map, prev_stl.device_dtype
+    )
+
+    result = torch_spyre._C.as_strided_with_layout(
+        self, sizes, strides, self.storage_offset(), new_stl
+    )
+    return result
 
 
 # INSERT_CODEGEN_HERE

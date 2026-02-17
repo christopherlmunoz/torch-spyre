@@ -137,6 +137,8 @@ def lower_mm(x, y):
     x_loader = x.make_loader()
     y_loader = y.make_loader()
 
+    print(x.get_size(), y.get_size())
+
     result = Reduction.create(
         reduction_type=MATMUL_REDUCTION_OP,
         input_node=[x, y],
