@@ -83,15 +83,15 @@ def _autoload():
         CustomPrePasses,
         CustomPostPasses,
         scheduler_passes,
-        _maybe_run_pass,
+        _maybe_run_scheduler_pass,
     )
 
     torch._inductor.config.split_reductions = False
     torch._inductor.config.benchmark_harness = False
     torch._inductor.config.post_grad_custom_pre_pass = CustomPrePasses()
     torch._inductor.config.post_grad_custom_post_pass = CustomPostPasses()
-    torch._inductor.config._pre_fusion_custom_pass = lambda nodes: _maybe_run_pass(
-        scheduler_passes, nodes
+    torch._inductor.config._pre_fusion_custom_pass = (
+        lambda nodes: _maybe_run_scheduler_pass(scheduler_passes, nodes)
     )
     # Adding this configuration in so as to avoid the optimization of turning small matmuls into non-matmuls
     # found here: https://github.com/pytorch/pytorch/blob/main/torch/_inductor/ir.py#L1580

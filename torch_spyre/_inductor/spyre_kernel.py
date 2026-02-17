@@ -430,6 +430,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             # Reshapes, transposes, and other dataops
             in_di = self.derive_dim_info(value)
             out_di = self.derive_dim_info(dst)
+            print(f"Dimension infos!!! {in_di} {out_di}")
             args = [
                 create_tensor_arg(True, actuals.index(value.name), value.layout),
                 create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
