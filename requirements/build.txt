@@ -56,7 +56,7 @@ pyyaml==6.0.3
     # via
     #   pre-commit
     #   torch-spyre
-regex==2025.11.3
+regex==2026.1.15
     # via torch-spyre
 setuptools==75.8.2
     # via

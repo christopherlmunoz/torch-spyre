@@ -91,7 +91,7 @@ pyyaml==6.0.3
     #   pre-commit
     #   torch-spyre
     #   transformers
-regex==2025.11.3
+regex==2026.1.15
     # via
     #   torch-spyre
     #   transformers

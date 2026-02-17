@@ -16,7 +16,7 @@ numpy==2.3.5
     # via torch-spyre
 psutil==7.2.1
     # via torch-spyre
-regex==2025.11.3
+regex==2026.1.15
     # via torch-spyre
 setuptools==75.8.2
     # via torch

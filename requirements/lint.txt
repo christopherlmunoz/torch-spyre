@@ -36,7 +36,7 @@ psutil==7.2.1
     # via torch-spyre
 pyyaml==6.0.3
     # via pre-commit
-regex==2025.11.3
+regex==2026.1.15
     # via torch-spyre
 setuptools==75.8.2
     # via torch
