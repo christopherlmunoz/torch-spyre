@@ -239,10 +239,10 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
                 op_dim_splits["M"]
             )
         if op_dim_splits["N"] > 1:
-            n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 2)] = (
+            n.spyre_core_division[1][map_host_dim_to_device_dim(args[1].layout, 1)] = (
                 op_dim_splits["N"]
             )
-            n.spyre_core_division[2][map_host_dim_to_device_dim(output, 2)] = (
+            n.spyre_core_division[2][map_host_dim_to_device_dim(output, 1)] = (
                 op_dim_splits["N"]
             )
 
