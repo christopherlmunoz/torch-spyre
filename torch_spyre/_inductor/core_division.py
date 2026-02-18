@@ -220,7 +220,6 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
         # Parallelizable operation dimensions: M and N (not K, the reduction dim)
         sizes = [M, N]
-        # Prioritize M dimension over N dimension
         priorities = [2, 1]
         splits = multi_dim_core_split(sizes, max_cores, priorities)
         n.n_cores_used = math.prod(splits)
@@ -265,8 +264,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
             # Parallelizable operation dimensions: B, M, N (not K, the reduction dim)
             sizes = [B, M, N]
-            # Prioritize: B > N > M
-            priorities = [3, 1, 2]  # M=1 (lowest), N=2, B=3 (highest)
+            priorities = [3, 1, 2]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
 
@@ -325,8 +323,8 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
             # Parallelizable operation dimensions: B1, B2, M, N (not K, the reduction dim)
             sizes = [B1, B2, M, N]
-            # Prioritize: B1 > B2 > N > M
-            priorities = [4, 3, 1, 2]  # M=1 (lowest), N=2, B2=3, B1=4 (highest)
+            # NOTE: split priority can affect numerical error in unit tests
+            priorities = [3, 4, 1, 2]
             splits = multi_dim_core_split(sizes, max_cores, priorities)
             n.n_cores_used = math.prod(splits)
 
