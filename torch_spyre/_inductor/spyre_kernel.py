@@ -430,7 +430,6 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             # Reshapes, transposes, and other dataops
             in_di = self.derive_dim_info(value)
             out_di = self.derive_dim_info(dst)
-            print(f"Dimension infos!!! {in_di} {out_di}")
             args = [
                 create_tensor_arg(True, actuals.index(value.name), value.layout),
                 create_tensor_arg(False, actuals.index(real_dst_name), dst.layout),
@@ -439,6 +438,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 self.analyze_tensor_access(in_di, value),
                 self.analyze_tensor_access(out_di, dst),
             ]
+            nn_linear_transpose = False
             if isinstance(args[0], TensorArg) and isinstance(args[1], TensorArg):
                 # Determine data op based on tensor arg and scales
                 if (
@@ -451,6 +451,17 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 elif Counter(in_di) == Counter(out_di) and in_di != out_di:
                     # Transpose: check that the input / output DimensionInfo are the same, but in different order.
                     op = TRANSPOSE_OP
+                elif (
+                    Counter(args[0].host_size) == Counter(args[1].host_size)
+                    and args[0].host_size == args[1].host_size
+                    and args[0].device_layout.device_size
+                    != args[1].device_layout.device_size
+                ):
+                    # When doing torch.nn.Linear + relayout_linear_weights pass, we hit this case
+                    # When this happens, we need to mark the op as Transpose and hack around
+                    # the KernelSpec to get the right transpose to happen
+                    op = TRANSPOSE_OP
+                    nn_linear_transpose = True
                 elif (
                     args[1].device_layout.device_size
                     == args[0].device_layout.device_size
@@ -469,6 +480,10 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 ks.op_info["transposed_dims"] = [
                     d for d in range(len(in_di)) if in_di[d].var != out_di[d].var
                 ]
+
+            if nn_linear_transpose:
+                ks.dimensions.reverse()
+                ks.op_info["transposed_dims"] = [0, 1]
 
             self.kernel_specs.append(ks)
         else:

@@ -30,7 +30,6 @@ def relayout_linear_weights(graph: torch.fx.Graph) -> None:
             input_t, kernel_t = node.args
             input_t = cast(torch.fx.Node, input_t)
             kernel_t = cast(torch.fx.Node, kernel_t)
-            print(input_t.meta["val"], kernel_t.meta["val"])
             if not kernel_t.meta["val"].is_contiguous():
                 with graph.inserting_before(node):
                     # transpose_node = graph.call_function(torch.ops.aten.permute.default, args=(kernel_t, [1, 0]))

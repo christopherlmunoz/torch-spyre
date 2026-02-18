@@ -258,7 +258,6 @@ def propagate_spyre_tensor_layouts(
                     raise Unsupported(
                         f"missing device_tensor_layout on graph input {name}"
                     )
-                print(f"Input {name} has layout {stl}")
                 tb = V.graph.graph_inputs[name]
                 if (
                     not isinstance(tb, TensorBox)
