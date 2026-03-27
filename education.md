@@ -64,6 +64,11 @@ result = my_model(input_tensor)
 
 ### The Spyre hardware, briefly
 
+> **Dive deeper:** `docs/source/architecture/spyre_accelerator.md` for
+> the full hardware overview, and
+> `docs/source/architecture/dataflow_architecture.md` for the dataflow
+> accelerator model.
+
 You don't need to understand chip design, but a few facts help:
 
 - **32 cores** per card, each capable of AI math (matrix operations).
@@ -85,7 +90,7 @@ You don't need to understand chip design, but a few facts help:
 |---|---|
 | `torch_spyre/` | The Python package. Entry point, device registration, eager ops. |
 | `torch_spyre/_inductor/` | The compiler backend — the largest and most complex part. Translates PyTorch's intermediate representation into Spyre instructions. |
-| `torch_spyre/csrc/` | C++ code that talks to the actual hardware (memory, tensors, kernel execution). |
+| `torch_spyre/csrc/` | C++ code compiled into the `torch_spyre._C` extension module. Provides the hardware runtime: device memory allocator, tensor storage with `SpyreTensorLayout`, kernel execution, and DMA transfers. This is the bridge between Python and the actual Spyre silicon. |
 | `torch_spyre/ops/` | Eager-mode operation implementations and CPU fallbacks. |
 | `torch_spyre/device/` | PyTorch device interface (how PyTorch discovers and talks to Spyre). |
 | `tests/` | Test suites for eager ops, compiled ops, and building blocks. |
@@ -96,10 +101,17 @@ You don't need to understand chip design, but a few facts help:
 Here's what happens when you do `z = x + y` on a Spyre device:
 
 **In eager mode:**
-1. PyTorch's dispatcher sees the operation targets a `"spyre"` device.
-2. It routes to the Spyre implementation registered for `add`.
-3. That implementation calls into the C++ layer (`torch_spyre._C`), which
-   talks to the hardware, does the math, and returns a new Spyre tensor.
+1. PyTorch's **dispatcher** — a routing system that looks at what
+   operation you called and what device the tensor lives on — sees
+   this targets a `"spyre"` device.
+2. It finds the Spyre implementation registered for `add`.
+3. That implementation actually calls `torch.compile` under the hood,
+   compiling and running the operation through the full Inductor
+   pipeline (see compiled mode below). The result is cached, so
+   subsequent calls with the same shapes skip compilation. Spyre's
+   hardware operates on compiled programs — there's no way to "just
+   run" a single uncompiled op on the chip, so eager mode wraps
+   compiled mode transparently.
 
 **In compiled mode** (wrapped in `@torch.compile`):
 1. **Dynamo** (PyTorch's tracer) captures the Python code into an FX Graph
@@ -125,6 +137,11 @@ silicon."
 ---
 
 ## Chapter 2: The Compilation Pipeline
+
+> **Dive deeper:** `docs/source/compiler/architecture.md` for the
+> canonical compiler architecture reference, and
+> `docs/source/compiler/inductor_frontend.md` for a detailed look at
+> passes, lowerings, decompositions, and codegen.
 
 Chapter 1 gave you the 10,000-foot view: user code goes through Dynamo,
 Inductor, and the Spyre backend. Now let's zoom in on each stage. By the
@@ -186,7 +203,10 @@ A few things to notice:
 - The graph captures **data dependencies**, not Python control flow.
   If your code has an `if` statement that depends on tensor values,
   Dynamo can't trace through it statically — it "graph breaks" and
-  creates separate graphs for each segment.
+  creates separate graphs for each segment. This isn't fatal — each
+  segment gets compiled independently, and Python runs the glue code
+  between them in eager mode. But more graph breaks means less
+  optimization opportunity, so model authors try to minimize them.
 - Dynamo doesn't know or care about Spyre. It just records ATen ops.
 
 **Where torch-spyre hooks in:** Dynamo needs to know basic things about
@@ -349,9 +369,20 @@ eager op instead.
 
 ### Stage 4: Scheduling — "What becomes a kernel?"
 
-After lowering, the graph is a collection of Loop-Level IR nodes. The
-**scheduler** decides how to group them into **kernels** — units of work
-that will be sent to the device as a single program.
+After lowering, the graph is a collection of Loop-Level IR nodes.
+Inductor organizes these into a **scheduler graph** — a dependency graph
+where each `SchedulerNode` wraps an IR node and tracks what buffers it
+reads and writes. Dependencies are inferred automatically: if node B
+reads a buffer that node A writes, B depends on A. The scheduler graph
+is the "execution plan" layer — the FX Graph describes *what ops* to do,
+the Loop-Level IR describes *how to compute each op*, and the scheduler
+graph describes *what order to run them in and what data flows between
+them*. When we say the compiler "traverses the scheduler graph in
+topological order," it means walking from inputs to outputs, visiting
+each node only after all its dependencies are satisfied.
+
+The **scheduler** decides how to group these nodes into **kernels** —
+units of work that will be sent to the device as a single program.
 
 A key scheduler decision is **fusion** — combining multiple operations
 into a single kernel. Consider `y = relu(x + 1)`. Without fusion, this
@@ -391,8 +422,13 @@ passes (registered in `passes.py:scheduler_passes`):
    tensor and 32 cores, each core might process 32 elements.
 
 3. **`scratchpad_planning`** (scratchpad.py, optional) — plans usage of
-   Spyre's on-chip scratchpad memory (a small, fast memory close to the
-   compute units). Only runs when `LX_PLANNING=1`.
+   Spyre's on-chip **scratchpad memory**. Each Spyre core has a small,
+   fast SRAM (called LX) physically located next to the compute units,
+   in addition to the large DDR main memory. Think of it like CPU L1
+   cache vs. RAM — scratchpad is much faster but much smaller. This
+   pass decides which tensors (or parts of tensors) to place in
+   scratchpad for faster access. Only runs when `LX_PLANNING=1`
+   because it's still an evolving optimization.
 
 ### Stage 5: Kernel Compilation — "Loop-Level IR → OpSpec"
 
@@ -427,7 +463,7 @@ the back-end compiler needs to know about it:
 class TensorArg:
     is_input: bool             # input or output?
     arg_index: int             # position in the kernel's argument list
-    device_dtype: DataFormats  # on-device data format (e.g. SEN169_FP16)
+    device_dtype: DataFormats  # on-device data format (see note below)
     device_size: list[int]     # shape in device memory (stick-aligned)
     device_coordinates: list   # how iteration space maps to device dimensions
     dtype: torch.dtype         # host-side dtype (e.g. torch.float16)
@@ -436,6 +472,14 @@ class TensorArg:
     allocation: Any            # scratchpad memory offset, if applicable
     device_layout: SpyreTensorLayout  # full device memory layout descriptor
 ```
+
+**A note on `DataFormats`:** You'll see `DataFormats.SEN169_FP16`
+throughout the codebase. This is Spyre's internal name for its float16
+data format — "SEN169" refers to the specific encoding the hardware
+uses. For practical purposes, `SEN169_FP16` ≈ `torch.float16`. The
+`DataFormats` enum also determines the stick size (64 elements for
+fp16, 32 for fp32) since different precisions pack differently into
+the 128-byte stick.
 
 For a concrete example, imagine `C = A + B` where A and B are both
 [64, 128] float16 tensors. The resulting OpSpec would look roughly like:
@@ -618,6 +662,9 @@ work together at runtime.
 
 ### Stage 7: Back-End Compilation — "JSON → Binary"
 
+> **Dive deeper:** `docs/source/compiler/backend.md` for documentation
+> on the DeepTools back-end compiler and the SuperDSC format.
+
 The SuperDSC JSON is handed to **DeepTools**, IBM's proprietary back-end
 compiler (not in this repo). DeepTools takes the per-core specifications
 and produces an optimized binary program that runs directly on the Spyre
@@ -695,6 +742,10 @@ only activates when Spyre tensors are present.
 ---
 
 ## Chapter 3: Tensor Layouts & Sticks
+
+> **Dive deeper:** `docs/source/user_guide/tensors_and_layouts.md` for
+> the full tensor layout specification with diagrams, DMA encoding
+> details, and layout compatibility rules.
 
 We've mentioned "sticks," "tiling," and `SpyreTensorLayout` throughout
 the previous chapters. This chapter explains what they actually are and
@@ -798,8 +849,14 @@ split into 4 groups of 64. To reconstruct the original column index:
 
 A `dim_map` value of **-1** indicates a **synthetic dimension** — one
 that doesn't correspond to any CPU dimension. This is used for **sparse
-tensors** (tensors where reductions produce only one meaningful element
-per stick, with the rest being padding).
+tensors**. Here's why they exist: when a reduction op (like `sum` or
+`mean`) collapses a dimension, the output might have just one element
+where the input had 64 (a full stick). But Spyre still reads and writes
+in sticks — you can't have a "partial stick." So the output gets a
+synthetic inner dimension of size 64, where only the first element is
+meaningful and the rest are padding. The `-1` in `dim_map` marks this
+dimension as "doesn't map to any CPU dimension — it's just here for
+stick alignment."
 
 ### A real example
 
@@ -967,6 +1024,11 @@ to device computation.
 ---
 
 ## Chapter 4: Adding a New Operation
+
+> **Dive deeper:** `docs/source/compiler/adding_operations.md` for the
+> canonical operation cookbook, and
+> `docs/source/user_guide/supported_operations.md` for the current list
+> of supported ops.
 
 This is the practical chapter. By now you understand the compilation
 pipeline (Chapter 2) and tensor layouts (Chapter 3). Here we walk
@@ -1265,9 +1327,471 @@ When you're asked to add support for an op (say, `aten.foo`):
 4. **Fallback as a last resort.** If you just need the op to not crash
    and performance doesn't matter, register a CPU fallback.
 
+### Key vocabulary recap
+
+| Term | What it is |
+|---|---|
+| **Pattern 1** | Direct ATen → OpFunc mapping (one entry in `SpyreOpFuncs`) |
+| **Pattern 2** | Spyre-specific decomposition (rewrite into existing supported ops) |
+| **Pattern 3** | Custom op (new op definition + lowering + OpFunc entry) |
+| **Fallback** | CPU-side execution via `@register_fallback` |
+| **`@custom_op`** | PyTorch decorator for registering a new op in the op registry |
+| **`@register_fake`** | Shape inference function used during tracing (no real data) |
+| **`compare_with_cpu`** | Test utility: compile for Spyre, run on CPU, compare results |
+
 ---
 
-*Next: Chapter 5 could cover Eager Mode (how single operations dispatch
-without compilation), Core Division & Work Distribution (how computation
-is split across 32 cores), or the C++ Layer (torch_spyre/csrc/ and the
-hardware runtime).*
+## Chapter 5: Eager Mode
+
+> **Dive deeper:** `docs/source/runtime/overview.md` for the runtime
+> layer (device lifecycle, memory allocation, kernel execution), and
+> `docs/source/user_guide/debugging.md` for investigating incorrect
+> behavior and compilation failures.
+
+Chapters 2–4 focused on the compiled path (`torch.compile`). But most
+PyTorch code runs without compilation — you just write operations and
+they execute immediately. This is **eager mode**, and torch-spyre
+supports it too.
+
+### What eager mode means
+
+In eager mode, there's no tracing, no FX Graph, no Inductor, no
+SuperDSC. Each operation executes the moment Python encounters it:
+
+```python
+x = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+y = torch.relu(x)       # executes immediately, returns result
+z = y + x                # executes immediately, returns result
+```
+
+Every line is a complete round-trip: Python tells the device "do this,"
+the device does it, Python gets the result. Simple, debuggable, but
+slower than compiled mode because of per-operation overhead.
+
+### How PyTorch dispatches to Spyre
+
+When you call `torch.relu(x)` on a Spyre tensor, PyTorch needs to find
+the right implementation. This is the **dispatcher** — PyTorch's routing
+system that looks at the operation and the tensor's device, then calls
+the correct backend function.
+
+torch-spyre registers its eager ops under the **PrivateUse1** dispatch
+key (which was renamed to `"spyre"`). There are three mechanisms used,
+depending on the operation:
+
+#### Mechanism 1: Direct kernel registration (`eager.py`)
+
+For operations that need hand-written Spyre implementations, torch-spyre
+registers kernels directly in `torch_spyre/ops/eager.py` using
+`@torch.library.register_kernel`:
+
+```python
+# In eager.py:
+@torch.library.register_kernel("aten::fill_.Scalar", ["spyre"])
+def spyre__fill_scalar(self, other):
+    tmp = torch.ones(self.size(), dtype=self.dtype) * other
+    self.copy_(tmp)
+    return self
+```
+
+This tells PyTorch: "when `aten::fill_.Scalar` is called on a Spyre
+tensor, use this function." The dispatcher sees the `"spyre"` device
+and routes directly here.
+
+Some of these are simple CPU-side implementations (like `fill_` above,
+which creates a CPU tensor and copies it to the device). Others are
+more interesting — they use `torch.compile` internally:
+
+```python
+@torch.library.register_kernel("aten::mm", ["spyre"])
+def spyre__mm(self, mat2):
+    compiled_mm = torch.compile(torch.mm, dynamic=False)
+    return compiled_mm(self, mat2)
+```
+
+This is a key pattern: **eager mode calls compiled mode under the
+hood.** When you do `x @ y` on Spyre tensors without `torch.compile`,
+the eager dispatch for `mm` actually compiles and runs the operation
+through the full Inductor pipeline (Chapter 2). The compilation result
+is cached, so subsequent calls with the same shapes reuse the compiled
+kernel.
+
+This makes sense for Spyre because the device operates on compiled
+programs — there's no way to "just run" an uncompiled matmul on the
+hardware. The eager wrapper hides this complexity from the user.
+
+#### Mechanism 2: DispatchKey registration (decompositions → eager)
+
+Remember from Chapter 4 that `@register_spyre_decomposition` registers
+decompositions for the compiled path? It also does double duty: for
+ATen ops, it simultaneously registers a **PrivateUse1 dispatch kernel**
+so the same decomposition works in eager mode too.
+
+Why is this necessary? Some ATen ops have a dispatch key called
+**CompositeImplicitAutograd (CIA)** — meaning PyTorch provides a
+default implementation that works for *any* backend by decomposing
+into simpler ops. The problem is that CIA dispatch happens *before*
+the device-specific dispatch. So if `aten.layer_norm` is CIA, calling
+it on a Spyre tensor would use PyTorch's generic decomposition (which
+may produce ops Spyre can't handle) instead of Spyre's custom
+decomposition. Registering a PrivateUse1 kernel explicitly ensures
+Spyre's version takes priority over the CIA fallback.
+
+Here's how it works. When you register a decomposition like:
+
+```python
+@register_spyre_decomposition([torch.ops.aten.layer_norm.default])
+def spyre_layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-5):
+    mean = torch.ops.spyre.exx2(input, 1.0 / normalized_shape[0], False)
+    norm_mean = torch.ops.spyre.layernormscale(mean, eps)
+    return torch.ops.spyre.layernormnorm(input, mean, norm_mean, weight, bias)
+```
+
+Behind the scenes, `register_spyre_decomposition` also calls
+`register_spyre_decompositions_via_dispatchkey`, which creates an
+**`OPWrapper`** — an object that decides what to do based on context:
+
+```python
+class OPWrapper:
+    def __init__(self, op, spyre_fn):
+        self.spyre_fn = spyre_fn
+        self._compiled_fn = torch.compile(spyre_fn, dynamic=False)
+
+    def __call__(self, *args, **kwargs):
+        if torch.compiler.is_compiling():
+            # Inside torch.compile: call the decomposition directly
+            return self.spyre_fn(*args, **kwargs)
+        else:
+            # Eager mode: use the pre-compiled version
+            return self._compiled_fn(*args, **kwargs)
+```
+
+The `OPWrapper` is registered as the PrivateUse1 kernel for the op. So
+when `aten.layer_norm` is called on a Spyre tensor in eager mode:
+
+1. The dispatcher finds the PrivateUse1 kernel (the `OPWrapper`).
+2. `OPWrapper.__call__` sees we're not inside `torch.compile`.
+3. It calls `self._compiled_fn` — a pre-compiled version of the
+   decomposition function.
+4. That triggers the full compilation pipeline (Dynamo → Inductor →
+   Spyre backend → DeepTools) and caches the result.
+
+The pre-compilation (`torch.compile(spyre_fn, dynamic=False)`) happens
+once when the wrapper is created. Subsequent calls with the same shapes
+skip compilation entirely and reuse the cached kernel.
+
+#### Mechanism 3: CPU fallbacks (`fallbacks.py`)
+
+For ops that Spyre doesn't implement natively, the fallback mechanism
+(covered in Chapter 4) provides eager-mode support by bouncing to CPU:
+
+```python
+@register_fallback([aten.sin.default, aten.sin.out])
+def spyre__sin(input, **kwargs):
+    return torch.sin(input, **kwargs)
+```
+
+The `@register_fallback` decorator registers a PrivateUse1 kernel that:
+1. Moves tensor inputs from Spyre → CPU.
+2. Runs the operation on CPU.
+3. Moves results back CPU → Spyre.
+
+This is transparent but slow (two DMA transfers + CPU execution).
+Fallback ops emit a warning so you know they're not running natively.
+
+### The initialization sequence
+
+These registrations don't all happen at import time. They follow a
+specific order, triggered by `_SpyreImpl._lazy_init()` (the first
+time you access the Spyre device):
+
+1. **C++ runtime starts** — `torch_spyre._C.start_runtime()` initializes
+   the hardware allocator and device.
+
+2. **Tensor patches applied** — `_patch_tensor_for_spyre()` in
+   `_monkey_patch.py` adds Spyre-specific behavior to `torch.Tensor`:
+   - Custom `__repr__` that shows Spyre tensor contents (copies to CPU
+     for display).
+   - Extended `.to()` that accepts a `device_layout` argument.
+   - Extended `torch.empty()` that accepts a `device_layout` argument.
+   - A `.device_tensor_layout()` method to inspect the
+     `SpyreTensorLayout`.
+
+3. **Inductor backend registered** — `_autoload()` registers
+   `SpyreInterface`, `SuperDSCScheduling`, and
+   `SpyrePythonWrapperCodegen` with PyTorch.
+
+4. **Custom ops loaded** — `customops.py` is imported, making
+   `torch.ops.spyre.*` available.
+
+5. **DispatchKey kernels registered** —
+   `_register_spyre_dispatchkey_kernels_permanently()` takes all the
+   `OPWrapper` instances from step 2-style registrations and
+   permanently installs them as PrivateUse1 dispatch kernels. The
+   `Library` objects are stored in module-level globals so they're
+   never garbage-collected (which would silently unregister the
+   kernels).
+
+### The big picture: eager = compiled, just hidden
+
+The most important takeaway: **on Spyre, eager mode is largely
+compiled mode with the compilation hidden behind dispatch wrappers.**
+Unlike a CPU or GPU where eager ops have hand-written C++/CUDA kernels,
+Spyre's hardware requires compiled programs. So the eager wrappers
+call `torch.compile` under the hood, cache the results, and present
+a seamless eager interface.
+
+This means:
+- **First call is slow** — it triggers compilation (Dynamo → Inductor →
+  DeepTools). Subsequent calls with the same shapes are fast.
+- **Same code paths** — a bug in the compiled path usually affects
+  eager mode too, because they share the same backend.
+- **Some ops are pure CPU** — operations like `fill_`, `normal_`,
+  `zero_` create data on CPU and copy it to the device. These don't
+  go through the compiler at all.
+
+```text
+User calls torch.relu(spyre_tensor)
+  → PyTorch dispatcher finds PrivateUse1 kernel
+     ├─ Direct kernel (eager.py)?      → hand-written implementation
+     ├─ OPWrapper (decompositions.py)? → torch.compile(decomp_fn)(args)
+     └─ Fallback (fallbacks.py)?       → move to CPU, run, move back
+```
+
+### Key vocabulary recap
+
+| Term | What it is |
+|---|---|
+| **Dispatcher** | PyTorch's routing system that maps (operation + device) → implementation |
+| **PrivateUse1** | The dispatch key used for custom devices; renamed to `"spyre"` |
+| **`OPWrapper`** | Object that routes between compiled context (direct call) and eager (pre-compiled) |
+| **CIA** | CompositeImplicitAutograd — PyTorch's generic decomposition that custom backends must override |
+| **`_lazy_init`** | Thread-safe initialization that runs on first device access |
+| **`torch.library`** | PyTorch API for registering kernels and custom ops with the dispatcher |
+
+---
+
+## Chapter 6: Core Division & Work Distribution
+
+> **Dive deeper:** `docs/source/compiler/work_division_planning.md` for
+> the full planning algorithm with diagrams, and
+> `docs/source/compiler/work_division_codegen.md` for how division plans
+> are translated into executable code.
+
+Spyre has 32 cores. A single operation on a large tensor can't run on
+just one core and expect good performance — it would leave 31 cores
+idle. This chapter explains how the compiler divides work across cores.
+
+### The basic idea
+
+Core division is conceptually simple: if you have a [1024, 128] tensor
+and 32 cores, you could give each core 32 rows (1024 / 32 = 32). Each
+core runs the same program on its slice of the data — this is called
+**SPMD** (Single Program, Multiple Data).
+
+The tricky parts:
+- Not all dimensions divide evenly by 32.
+- Some operations have multiple dimensions you could split.
+- Some dimensions (like the reduction dimension in a matmul) have
+  different splitting semantics than output dimensions.
+- The split must respect stick boundaries.
+
+### Where core division happens in the pipeline
+
+Core division runs as a **scheduler pass** — after lowering and
+stickification, but before kernel compilation (Chapter 2, Stage 4).
+The entry point is `core_division_planning()` in
+`torch_spyre/_inductor/core_division.py`.
+
+```text
+Loop-Level IR nodes (with layouts assigned by stickification)
+    │
+    ▼
+core_division_planning()
+    ├─ For each Pointwise node  → divide_pointwise_op()
+    ├─ For each Reduction node  → divide_reduction_op()
+    └─ Others                   → single-core (no division)
+    │
+    ▼
+Nodes annotated with op_dim_splits and n_cores_used
+```
+
+The pass walks the scheduler graph in topological order. For each
+operation, it decides how to split the work, then annotates the node.
+These annotations flow into the OpSpec (Chapter 2, Stage 5) and
+ultimately into the SuperDSC JSON that tells each core which slice
+of data to process.
+
+### The core splitting algorithm
+
+The algorithm is a **greedy, priority-based approach**:
+
+1. List the dimensions that can be parallelized, with their sizes.
+2. Assign priorities (which dimension to split first).
+3. Starting with the highest-priority dimension, find the largest
+   divisor of its size that doesn't exceed the remaining core budget.
+4. Allocate those cores, reduce the budget, move to the next dimension.
+5. Stop when cores are exhausted or no even divisions remain.
+
+The constraint that splits must **divide evenly** is important — Spyre
+doesn't support uneven splits (no "core 31 gets fewer elements than the
+rest"). If 32 doesn't divide your dimension size evenly, the algorithm
+finds the largest divisor that does.
+
+Here's the actual core function:
+
+```python
+def core_split(size: int, max_cores: int) -> int:
+    """Find the largest divisor of size that doesn't exceed max_cores."""
+    for i in range(max_cores, 0, -1):
+        if size % i == 0:
+            return i
+    return 1
+```
+
+And the multi-dimensional version:
+
+```python
+def multi_dim_core_split(sizes, max_cores, priorities):
+    splits = [1] * len(sizes)
+    # Sort dimensions by priority (highest first)
+    # For each dimension, greedily allocate cores
+    for dim_idx, size, _ in sorted_by_priority:
+        best_split = core_split(size, remaining_cores)
+        splits[dim_idx] = best_split
+        remaining_cores //= best_split
+    return splits
+    # Product of all splits = total cores used
+```
+
+### Pointwise operations
+
+For element-wise ops (add, relu, mul, etc.), every output element is
+independent — perfect for parallelism. The strategy is straightforward:
+split the output tensor's dimensions across cores.
+
+**Example:** `relu` on a [128, 256] tensor with 32 cores:
+
+```text
+sizes      = [128, 256]     # but 256 is in sticks, so really [128, 4]
+priorities = [128, 4]       # larger dimensions get higher priority
+
+core_split: 128 / 32 = 4 → splits[0] = 32, remaining = 1
+Result: op_dim_splits = [32, 1]
+→ 32 cores, each processing 4 rows of 256 elements
+```
+
+**Important detail:** for the stick dimension (the innermost device
+dimension), the parallelizable unit is the number of *sticks*, not
+elements. A 256-element row at fp16 is 4 sticks. You can't split
+within a stick — the hardware reads whole sticks.
+
+**Limitation:** if any input has a different shape (broadcasting), core
+division is skipped and the op runs on a single core. This is a current
+limitation, not a fundamental constraint.
+
+### Matrix multiplication
+
+Matmul is more interesting because it has three dimensions: M (rows),
+K (reduction), and N (columns) in `C[M,N] = A[M,K] × B[K,N]`.
+
+The priority order matters:
+
+| Priority | Dimension | Why |
+|---|---|---|
+| Highest (3) | M (rows) | Output dimension, independent slices |
+| Medium (2) | N (columns) | Output dimension, independent slices |
+| Lowest (1) | K (reduction) | Splitting the reduction creates partial sums that must be accumulated — more complex |
+
+**Example:** 8 cores, M=128, K=64, N=64:
+
+```text
+sizes      = [128, 64, 64]     # [M, K, N]
+priorities = [3, 1, 2]          # M first, then N, then K
+
+Step 1: M=128, try core_split(128, 8) → 8. But then no cores for N.
+        Actually: core_split(128, 8) → 4. splits[M] = 4, remaining = 2
+Step 2: K=64, but N has higher priority, so N goes first.
+        core_split(64, 2) → 2. splits[N] = 2, remaining = 1
+Result: op_dim_splits = [4, 1, 2]   # [M_split, K_split, N_split]
+→ 8 cores total: 4 row tiles × 2 column tiles
+→ Each core computes a 32×32 block of the output
+```
+
+K is only split as a last resort because splitting the reduction
+dimension means each core computes a *partial* sum, and the partial
+sums need to be combined afterward — more complexity in the backend.
+
+### Batched matrix multiplication
+
+BMM adds batch dimensions. For a 3D `[B, M, K] × [B, K, N]`:
+
+| Priority | Dimension | Why |
+|---|---|---|
+| Highest (4) | B (batch) | Completely independent — perfect parallelism |
+| High (3) | N (columns) | Output dimension |
+| Medium (2) | M (rows) | Output dimension |
+| Lowest (1) | K (reduction) | Partial sums, avoid if possible |
+
+Batch dimensions get top priority because each batch is entirely
+independent — no partial sums, no accumulation, no communication
+between cores.
+
+### How the splits reach the hardware
+
+After `core_division_planning` annotates each node, the information
+flows through the remaining pipeline stages:
+
+1. **OpSpec** (Stage 5) — `op_info["n_cores_used"]` and
+   `op_info["op_dim_splits"]` are stored in the OpSpec.
+
+2. **SDSCSpec** (Stage 6) — `parse_op_spec` converts splits into
+   `work_slices` (how many slices per dimension) and
+   `core_id_to_work_slice` (which slice each core gets). This uses
+   modular arithmetic to map core IDs to multi-dimensional slice
+   coordinates:
+
+   ```python
+   # For op_dim_splits = [4, 1, 2] with 8 cores:
+   # core 0 → slice (0, 0, 0)  — row tile 0, col tile 0
+   # core 1 → slice (0, 0, 1)  — row tile 0, col tile 1
+   # core 2 → slice (1, 0, 0)  — row tile 1, col tile 0
+   # ...
+   # core 7 → slice (3, 0, 1)  — row tile 3, col tile 1
+   ```
+
+3. **SuperDSC JSON** — the `coreIdToWkSlice_` field tells each core
+   exactly which slice of the iteration space it owns.
+
+4. **DeepTools** — reads the per-core slice assignments and generates
+   binary code where each core processes its assigned data region.
+
+### Configuring the core count
+
+The number of cores is controlled by the `SENCORES` environment
+variable (default: 32, valid range: 1–32):
+
+```bash
+SENCORES=1 python my_script.py   # Single-core execution (useful for debugging)
+SENCORES=8 python my_script.py   # Use 8 cores
+SENCORES=32 python my_script.py  # Full parallelism (default)
+```
+
+Setting `SENCORES=1` disables core division entirely — useful for
+isolating bugs that might be caused by the division logic.
+
+### Key vocabulary recap
+
+| Term | What it is |
+|---|---|
+| **SPMD** | Single Program, Multiple Data — all cores run the same program on different data |
+| **`op_dim_splits`** | Per-dimension split counts (e.g., [4, 1, 2] = 4×1×2 = 8 cores) |
+| **Core split** | Finding the largest divisor of a dimension that fits the core budget |
+| **Work slice** | The specific region of iteration space assigned to one core |
+| **Stick boundary** | Splits respect stick alignment — can't split within a 64-element stick |
+
+---
+
+*Next: Chapter 7 could cover the C++ Layer (torch_spyre/csrc/ and
+the hardware runtime), or the Scratchpad (on-chip fast memory planning
+with `LX_PLANNING=1`).*
