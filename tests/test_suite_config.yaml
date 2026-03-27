@@ -1,48 +1,19 @@
 test_suite_config:
   files:
-    - path: ${PYTORCH}/test/test_binary_ufuncs.py
+    - path: ${PYTORCH}/test/test_modules.py
       unlisted_test_mode: skip
       tests:
         - names:
-            - TestBinaryUfuncs::test_scalar_support
-            - TestBinaryUfuncs::test_contig_vs_transposed
-          mode: xfail
-          tags:
-            - model_1
-            - model_2
-          edits:
-            ops:
-              include:
-                - name: add
-                  description: inject add — binary_ufuncs_with_references excludes it if ref is None
-              exclude:
-                - name: gcd
-                  description: gcd causes buffer alignment errors for this test
-            dtypes:
-              include:
-                - name: float32
-              exclude:
-                - name: bfloat16
-                  description: bfloat16 unsupported on Spyre for this test
-
-        # Single test — name as a list with one entry (or plain string, both accepted)
-        - names:
-            - TestBinaryUfuncs::test_add
-          mode: mandatory_success
-          tags:
-            - tag_for_add
-
-    - path: ${PYTORCH}/test/test_ops.py
-      unlisted_test_mode: skip
-      tests:
-        - names:
-            - TestCommon::test_compare_cpu
+            - TestModule::test_forward
           mode: mandatory_success
           edits:
-            dtypes:
+            modules:
+              include:
+                - name: torch.nn.BatchNorm2d
+                  description: add batchnorm even though not in global.supported_modules
               exclude:
-                - name: float32
-                  description: corrupted double-linked list
+                - name: torch.nn.Linear
+                  description: Linear causes OOM on this test
 
   global:
     supported_dtypes:
@@ -59,4 +30,9 @@ test_suite_config:
       - name: mul
       - name: sub
       - name: gcd
+        force_xfail: true
+    supported_modules:
+      - name: torch.nn.Linear
+      - name: torch.nn.Conv2d
+      - name: torch.nn.ReLU
         force_xfail: true
