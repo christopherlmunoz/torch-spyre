@@ -263,13 +263,13 @@ def _create_sdsc_tensors(
         max_dim_sizes: dict = {}
         reduced_dims: list = []
 
+        if use_op_dims and dim_order != dims:
+            reduced_dims = [d for d in op_dim_order if d not in dim_order]
+            dim_order = dim_order + reduced_dims
         if op_stick_dim is None:
             # No stick dim found in op - add one
             stick_dim = next(d for d in dims if d not in op_dim_order)
             dim_order = dim_order + [stick_dim]
-        elif use_op_dims and dim_order != dims:
-            reduced_dims = [d for d in op_dim_order if d not in dim_order]
-            dim_order = dim_order + reduced_dims
         if op_spec.op == "layernormscale" and len(sdsc_args) == 0:
             reduced_dims = [stick_dim]
         for dim_idx, dim in enumerate(dim_order):
@@ -313,11 +313,11 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
     is_data_op = _is_data_op(op_spec.op)
-    ndim = len(op_spec.iteration_space_dict)
+    ndim = len(op_spec.iteration_space)
     dim_labels = _get_op_dim_labels(ndim, is_matmul)
 
     symbol_mapping = {
-        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space_dict)
+        sym: Symbol(dim_labels[i]) for i, sym in enumerate(op_spec.iteration_space)
     }
     logger.debug(
         "symbol mapping: %s",
@@ -326,18 +326,18 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
 
     sdsc_iteration_space = {
         symbol_mapping[sym]: (size.p if isinstance(size, Integer) else size)
-        for sym, (size, _) in op_spec.iteration_space_dict.items()
+        for sym, (size, _) in op_spec.iteration_space.items()
     }
 
     dim_splits = {
         symbol_mapping[dim]: value[-1] if not is_data_op else 1
-        for dim, value in op_spec.iteration_space_dict.items()
+        for dim, value in op_spec.iteration_space.items()
     }
     num_cores = math.prod(dim_splits.values())
 
     work_slices = {
         symbol_mapping[sym]: wk_slice if not is_data_op else 1
-        for sym, (_, wk_slice) in op_spec.iteration_space_dict.items()
+        for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
     ref_arg = op_spec.args[0] if op_spec.is_reduction else op_spec.args[-1]
