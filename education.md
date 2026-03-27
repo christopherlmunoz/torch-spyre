@@ -64,10 +64,11 @@ result = my_model(input_tensor)
 
 ### The Spyre hardware, briefly
 
-> **Dive deeper:** `docs/source/architecture/spyre_accelerator.md` for
+> **Dive deeper:**
+> [Spyre Accelerator](docs/source/architecture/spyre_accelerator.md) for
 > the full hardware overview, and
-> `docs/source/architecture/dataflow_architecture.md` for the dataflow
-> accelerator model.
+> [Dataflow Architecture](docs/source/architecture/dataflow_architecture.md)
+> for the dataflow accelerator model.
 
 You don't need to understand chip design, but a few facts help:
 
@@ -138,10 +139,11 @@ silicon."
 
 ## Chapter 2: The Compilation Pipeline
 
-> **Dive deeper:** `docs/source/compiler/architecture.md` for the
+> **Dive deeper:**
+> [Compiler Architecture](docs/source/compiler/architecture.md) for the
 > canonical compiler architecture reference, and
-> `docs/source/compiler/inductor_frontend.md` for a detailed look at
-> passes, lowerings, decompositions, and codegen.
+> [Inductor Front-End Deep Dive](docs/source/compiler/inductor_frontend.md)
+> for a detailed look at passes, lowerings, decompositions, and codegen.
 
 Chapter 1 gave you the 10,000-foot view: user code goes through Dynamo,
 Inductor, and the Spyre backend. Now let's zoom in on each stage. By the
@@ -662,7 +664,8 @@ work together at runtime.
 
 ### Stage 7: Back-End Compilation — "JSON → Binary"
 
-> **Dive deeper:** `docs/source/compiler/backend.md` for documentation
+> **Dive deeper:**
+> [Back-End Compiler](docs/source/compiler/backend.md) for documentation
 > on the DeepTools back-end compiler and the SuperDSC format.
 
 The SuperDSC JSON is handed to **DeepTools**, IBM's proprietary back-end
@@ -743,8 +746,9 @@ only activates when Spyre tensors are present.
 
 ## Chapter 3: Tensor Layouts & Sticks
 
-> **Dive deeper:** `docs/source/user_guide/tensors_and_layouts.md` for
-> the full tensor layout specification with diagrams, DMA encoding
+> **Dive deeper:**
+> [Tensors and Layouts](docs/source/user_guide/tensors_and_layouts.md)
+> for the full tensor layout specification with diagrams, DMA encoding
 > details, and layout compatibility rules.
 
 We've mentioned "sticks," "tiling," and `SpyreTensorLayout` throughout
@@ -1025,10 +1029,11 @@ to device computation.
 
 ## Chapter 4: Adding a New Operation
 
-> **Dive deeper:** `docs/source/compiler/adding_operations.md` for the
+> **Dive deeper:**
+> [Adding Operations](docs/source/compiler/adding_operations.md) for the
 > canonical operation cookbook, and
-> `docs/source/user_guide/supported_operations.md` for the current list
-> of supported ops.
+> [Supported Operations](docs/source/user_guide/supported_operations.md)
+> for the current list of supported ops.
 
 This is the practical chapter. By now you understand the compilation
 pipeline (Chapter 2) and tensor layouts (Chapter 3). Here we walk
@@ -1343,10 +1348,11 @@ When you're asked to add support for an op (say, `aten.foo`):
 
 ## Chapter 5: Eager Mode
 
-> **Dive deeper:** `docs/source/runtime/overview.md` for the runtime
+> **Dive deeper:**
+> [Runtime Overview](docs/source/runtime/overview.md) for the runtime
 > layer (device lifecycle, memory allocation, kernel execution), and
-> `docs/source/user_guide/debugging.md` for investigating incorrect
-> behavior and compilation failures.
+> [Debugging Guide](docs/source/user_guide/debugging.md) for
+> investigating incorrect behavior and compilation failures.
 
 Chapters 2–4 focused on the compiled path (`torch.compile`). But most
 PyTorch code runs without compilation — you just write operations and
@@ -1573,10 +1579,11 @@ User calls torch.relu(spyre_tensor)
 
 ## Chapter 6: Core Division & Work Distribution
 
-> **Dive deeper:** `docs/source/compiler/work_division_planning.md` for
-> the full planning algorithm with diagrams, and
-> `docs/source/compiler/work_division_codegen.md` for how division plans
-> are translated into executable code.
+> **Dive deeper:**
+> [Work Division Planning](docs/source/compiler/work_division_planning.md)
+> for the full planning algorithm with diagrams, and
+> [Work Division Codegen](docs/source/compiler/work_division_codegen.md)
+> for how division plans are translated into executable code.
 
 Spyre has 32 cores. A single operation on a large tensor can't run on
 just one core and expect good performance — it would leave 31 cores
@@ -1792,6 +1799,451 @@ isolating bugs that might be caused by the division logic.
 
 ---
 
-*Next: Chapter 7 could cover the C++ Layer (torch_spyre/csrc/ and
-the hardware runtime), or the Scratchpad (on-chip fast memory planning
-with `LX_PLANNING=1`).*
+## Chapter 7: End-to-End Walkthrough
+
+We've covered every stage individually. Now let's trace a single
+example through the entire pipeline — from Python code to device
+execution — and see concrete data at each step.
+
+### The example
+
+```python
+import torch
+import torch_spyre
+
+@torch.compile
+def model(x, w):
+    return torch.relu(x @ w)
+
+x = torch.randn(32, 64, dtype=torch.float16, device="spyre")
+w = torch.randn(64, 128, dtype=torch.float16, device="spyre")
+y = model(x, w)
+```
+
+Two operations: a matrix multiply (`x @ w`) producing a [32, 128]
+result, then a pointwise relu. Let's follow them through every stage.
+
+### Stage 1: Dynamo traces the FX Graph
+
+Dynamo watches `model` execute and captures:
+
+```text
+%x       = placeholder             # [32, 64] fp16, device=spyre
+%w       = placeholder             # [64, 128] fp16, device=spyre
+%mm      = call_function: aten.mm(%x, %w)
+%relu    = call_function: aten.relu(%mm)
+return (%relu,)
+```
+
+Four nodes, two operations. Dynamo doesn't know about Spyre — this is
+the same graph you'd get for CPU or GPU. The `compile_fx` wrapper
+(Chapter 2) detects Spyre tensors in the inputs and activates the
+Spyre context.
+
+### Stage 2: AOTAutograd
+
+Strips gradient tracking. Since this is inference with no
+`requires_grad`, the graph passes through unchanged.
+
+### Stage 3a: Decompositions
+
+Inductor checks the decomposition table for `aten.mm` and `aten.relu`.
+
+- **`aten.mm`** — no Spyre-specific decomposition registered. It stays
+  as-is.
+- **`aten.relu`** — no Spyre-specific decomposition either. It stays
+  as-is.
+
+Both ops are simple enough that Spyre supports them directly. If this
+were `aten.layer_norm`, the decomposition would expand it into three
+custom Spyre ops here (Chapter 4, Pattern 2).
+
+### Stage 3b: FX Graph Passes
+
+`CustomPostPasses` runs. The passes look for patterns like scalar ops
+to convert to tensor ops, or `mm` patterns to convert to `bmm`. Our
+graph has a plain 2D `mm` and a `relu` — neither triggers a rewrite.
+The graph is unchanged.
+
+### Stage 3c: Lowering — FX Graph → Loop-Level IR
+
+Each FX node is lowered to Loop-Level IR.
+
+**`aten.mm` → Reduction:**
+
+```text
+Reduction(
+    ranges          = [32, 128],      # output shape: M=32 rows, N=128 cols
+    reduction_ranges = [64],          # K=64 (dimension being summed)
+    inner_fn         = (idx, r_idx) → (x[idx[0], r_idx[0]],
+                                       w[r_idx[0], idx[1]]),
+    reduction_type   = "matmul"
+)
+```
+
+**`aten.relu` → Pointwise:**
+
+```text
+Pointwise(
+    ranges   = [32, 128],            # same shape as mm output
+    inner_fn = (idx) → relu(mm_result[idx[0], idx[1]])
+)
+```
+
+### Stage 4a: Scheduler graph construction
+
+Inductor organizes these into a scheduler graph:
+
+```text
+SchedulerNode "buf0" (Reduction: matmul)
+    reads:  x, w
+    writes: buf0        ← the mm result [32, 128]
+        │
+        ▼
+SchedulerNode "buf1" (Pointwise: relu)
+    reads:  buf0
+    writes: buf1        ← the relu result [32, 128]
+```
+
+`buf1` depends on `buf0` — relu can't run until matmul finishes.
+
+### Stage 4b: No fusion
+
+`SuperDSCScheduling.can_fuse_vertical(buf0, buf1)` returns `False`.
+Each stays as its own kernel. On a GPU, these would likely be fused
+into one kernel. On Spyre, they stay separate so DeepTools can optimize
+each independently.
+
+### Stage 4c: Stickification — assign tensor layouts
+
+The stickification pass walks the graph and assigns `SpyreTensorLayout`
+to every buffer.
+
+**Input `x` [32, 64]:**
+
+64 elements in the last dimension = exactly 1 stick. No tiling needed
+for the stick dimension. The first dimension (32) gets tiled.
+
+```text
+SpyreTensorLayout(
+    device_size = [1, 32, 64],     # 1 tile, 32 rows, 64 elems/stick
+    dim_map     = [1, 0, 1],       # device dim 0 → CPU dim 1 (cols, tiled)
+                                   # device dim 1 → CPU dim 0 (rows)
+                                   # device dim 2 → CPU dim 1 (cols, within stick)
+    device_dtype = SEN169_FP16
+)
+```
+
+**Input `w` [64, 128]:**
+
+128 elements in the last dimension = 2 sticks. Tiling splits it.
+
+```text
+SpyreTensorLayout(
+    device_size = [2, 64, 64],     # 2 tiles, 64 rows, 64 elems/stick
+    dim_map     = [1, 0, 1],       # cols tiled into 2 groups of 64
+    device_dtype = SEN169_FP16
+)
+```
+
+**Output `buf0` (mm result) [32, 128]:**
+
+The matmul output layout is derived from the input layouts. The output
+has N=128 columns → 2 sticks, M=32 rows.
+
+```text
+SpyreTensorLayout(
+    device_size = [2, 32, 64],     # 2 tiles, 32 rows, 64 elems/stick
+    dim_map     = [1, 0, 1],
+    device_dtype = SEN169_FP16
+)
+```
+
+**Output `buf1` (relu result) [32, 128]:**
+
+Relu is pointwise — its output inherits the same layout as its input
+(`buf0`). Same `SpyreTensorLayout` as above. No restickify needed
+because the layouts match.
+
+### Stage 4d: Core division
+
+With `SENCORES=32` (default):
+
+**Matmul** (`buf0`): dimensions are M=32, K=64, N=128.
+
+But core division works in parallelizable units — for the stick
+dimension, that's the number of sticks, not elements. So:
+
+```text
+M = 32 (rows)
+K = 1  (sticks in reduction dim: 64/64 = 1)
+N = 2  (sticks in output cols: 128/64 = 2)
+
+priorities = [3, 1, 2]    # M highest, then N, then K
+```
+
+Step 1: M=32, `core_split(32, 32)` → 32. But 32 × 2 = 64 > 32.
+So: `core_split(32, 16)` → 16. splits[M] = 16, remaining = 2.
+Step 2: N=2, `core_split(2, 2)` → 2. splits[N] = 2, remaining = 1.
+
+```text
+op_dim_splits = [16, 1, 2]    # [M_split, K_split, N_split]
+n_cores_used  = 32            # 16 × 1 × 2 = 32
+```
+
+Each core computes a 2×64 block of the output (2 rows, 1 stick of 64
+columns).
+
+**Relu** (`buf1`): pointwise on [32, 128].
+
+```text
+sizes = [32, 2]    # 32 rows, 2 sticks
+priorities = [32, 2]
+
+core_split(32, 32) → 32. But 32 × 2 = 64 > 32.
+core_split(32, 16) → 16. splits[0] = 16, remaining = 2.
+core_split(2, 2) → 2. splits[1] = 2, remaining = 1.
+
+op_dim_splits = [16, 2]
+n_cores_used  = 32
+```
+
+Same 32 cores, same 2-row × 1-stick blocks. Because the relu has the
+same shape and layout as the matmul output, the division happens to
+match — each core processes the same region of data in both kernels.
+
+### Stage 5: Kernel compilation — Loop-Level IR → OpSpec
+
+`SpyreKernel` processes each scheduled node.
+
+**Matmul kernel:**
+
+The handler replays the Reduction IR. The `inner_fn` loads pairs of
+elements from `x` and `w`. The `store_reduction` method sees a
+`ReductionOp("matmul", [x_access, w_access])` and builds:
+
+```text
+OpSpec(
+    op              = "matmul",
+    is_reduction    = True,
+    iteration_space = [32, 64, 128],     # [M, K, N]
+    args            = [
+        TensorArg(is_input=True,  ...),  # x [32, 64]
+        TensorArg(is_input=True,  ...),  # w [64, 128]
+        TensorArg(is_input=False, ...),  # buf0 [32, 128] (output)
+    ],
+    op_info = {
+        "n_cores_used": 32,
+        "op_dim_splits": [16, 1, 2],
+    }
+)
+```
+
+**Relu kernel:**
+
+The handler replays the Pointwise IR. `SpyreOpFuncs.relu(x)` returns
+`PointwiseOp("relufwd", [x])`. The `store` method builds:
+
+```text
+OpSpec(
+    op              = "relufwd",
+    is_reduction    = False,
+    iteration_space = [32, 128],         # [M, N]
+    args            = [
+        TensorArg(is_input=True,  ...),  # buf0 [32, 128]
+        TensorArg(is_input=False, ...),  # buf1 [32, 128] (output)
+    ],
+    op_info = {
+        "n_cores_used": 32,
+        "op_dim_splits": [16, 2],
+    }
+)
+```
+
+### Stage 6a: OpSpec → SDSCSpec → SuperDSC JSON
+
+`parse_op_spec` converts each OpSpec to an SDSCSpec.
+
+**Matmul SDSCSpec** (simplified):
+
+```text
+SDSCSpec(
+    opfunc           = "matmul",
+    execution_unit   = "pt",              # matrix unit (not scalar/vector)
+    data_format      = SEN169_FP16,
+    num_cores        = 32,
+    iteration_space  = {mb: 32, in: 64, out: 128},
+    work_slices      = {mb: 16, in: 1, out: 2},
+    core_id_to_work_slice = {
+        mb: core_id % 16,                # which row tile
+        in: 0,                            # no K split
+        out: floor(core_id / 16) % 2,    # which col tile
+    },
+    ...
+)
+```
+
+Core 0 gets row tile 0, col tile 0 → rows 0–1, cols 0–63.
+Core 1 gets row tile 1, col tile 0 → rows 2–3, cols 0–63.
+...
+Core 16 gets row tile 0, col tile 1 → rows 0–1, cols 64–127.
+...
+Core 31 gets row tile 15, col tile 1 → rows 30–31, cols 64–127.
+
+`generate_sdsc` renders this into the final JSON:
+
+```json
+{
+    "matmul": {
+        "numCoresUsed_": 32,
+        "dscs_": [{
+            "matmul": {
+                "N_": {"mb_": 32, "in_": 64, "out_": 128},
+                "numWkSlicesPerDim_": {"mb": 16, "in": 1, "out": 2},
+                "coreIdToWkSlice_": {
+                    "0": {"mb": 0, "in": 0, "out": 0},
+                    "1": {"mb": 1, "in": 0, "out": 0},
+                    ...
+                    "16": {"mb": 0, "in": 0, "out": 1},
+                    ...
+                },
+                ...
+            }
+        }]
+    }
+}
+```
+
+The relu kernel gets a similar JSON, but with `opfunc: "relufwd"`,
+`execution_unit: "sfp"` (scalar/vector unit), and a 2D iteration space.
+
+### Stage 6b: Host-side wrapper code
+
+`SpyrePythonWrapperCodegen` generates a Python file that looks roughly
+like:
+
+```python
+# Auto-generated host code (simplified)
+from torch_spyre._C import spyre_empty_with_layout, SpyreTensorLayout
+from torch_spyre.execution.async_compile import SpyreAsyncCompile
+
+async_compile = SpyreAsyncCompile()
+
+# Compile both kernels (can happen in parallel)
+matmul_kernel = async_compile.spyre(matmul_sdsc_json, ...)
+relu_kernel   = async_compile.spyre(relu_sdsc_json, ...)
+
+def call(args):
+    x, w = args
+
+    # Allocate intermediate buffer for matmul output
+    buf0 = spyre_empty_with_layout(
+        (32, 128), (128, 1), torch.float16,
+        SpyreTensorLayout([2, 32, 64], [1, 0, 1], ..., SEN169_FP16)
+    )
+
+    # Allocate output buffer for relu
+    buf1 = spyre_empty_with_layout(
+        (32, 128), (128, 1), torch.float16,
+        SpyreTensorLayout([2, 32, 64], [1, 0, 1], ..., SEN169_FP16)
+    )
+
+    # Launch kernels in sequence
+    matmul_kernel(x, w, buf0)     # x @ w → buf0
+    relu_kernel(buf0, buf1)        # relu(buf0) → buf1
+
+    return (buf1,)
+```
+
+This is real, executable Python. The first call triggers DeepTools
+compilation of the two JSON specs into device binaries. Subsequent calls
+reuse the compiled binaries.
+
+### Stage 7: DeepTools → Binary → Execution
+
+DeepTools takes each SuperDSC JSON and produces optimized binary
+programs. For the matmul, it maps the per-core work slices onto Spyre's
+matrix multiplication dataflow hardware. For the relu, it maps the
+pointwise operation onto the scalar/vector processing units.
+
+At runtime:
+1. DMA transfers move `x` and `w` from host to device DDR (reorganizing
+   from row-major to tiled stick layout).
+2. The matmul binary executes — all 32 cores process their assigned
+   2×64 blocks in parallel, reading from `x` and `w`, writing to `buf0`.
+3. The relu binary executes — all 32 cores apply relu to their assigned
+   blocks of `buf0`, writing to `buf1`.
+4. DMA transfers move `buf1` back from device to host (reorganizing from
+   tiled stick layout back to row-major).
+5. The result tensor `y` is returned to Python.
+
+### The complete journey, in one picture
+
+```text
+Python: y = torch.relu(x @ w)
+    │
+    ▼
+Dynamo: FX Graph [mm, relu] ──────────── 2 ATen op nodes
+    │
+    ▼
+Decompositions: unchanged ─────────────── both ops supported directly
+    │
+    ▼
+FX Passes: unchanged ──────────────────── no patterns to rewrite
+    │
+    ▼
+Lowering: Loop-Level IR ───────────────── Reduction(matmul) + Pointwise(relu)
+    │
+    ▼
+Scheduler: 2 nodes, no fusion ─────────── each op is its own kernel
+    │
+    ▼
+Stickify: assign layouts ──────────────── [32,128] → device [2, 32, 64]
+    │
+    ▼
+Core division: 32 cores each ──────────── matmul [16,1,2], relu [16,2]
+    │
+    ▼
+SpyreKernel: 2 OpSpecs ────────────────── "matmul" + "relufwd"
+    │
+    ▼
+Codegen: 2 SuperDSC JSONs ─────────────── per-core work assignments
+       + host Python ──────────────────── alloc, compile, launch, return
+    │
+    ▼
+DeepTools: 2 device binaries ──────────── optimized for Spyre silicon
+    │
+    ▼
+Execution: DMA in → matmul → relu → DMA out → result in Python
+```
+
+### What to notice
+
+- **Two operations became two kernels.** On a GPU these would likely
+  fuse into one. On Spyre they stay separate — DeepTools handles
+  optimization at a lower level.
+
+- **The same 32-core division applies to both kernels.** Because the
+  relu has the same shape as the matmul output, each core works on the
+  same region of data in both kernels. This isn't always the case —
+  if the shapes differed, core division would be computed independently.
+
+- **Stickification added no restickify ops.** The matmul output layout
+  and the relu input layout are compatible. If we'd added a transpose
+  between them, the stickification pass would have inserted a
+  restickify operation to reorganize the sticks.
+
+- **The host code is straightforward Python.** Allocate buffers, launch
+  kernels in sequence, return. All the complexity is in the JSON specs
+  and the compiled binaries.
+
+- **First call pays the compilation cost.** Dynamo tracing, Inductor
+  lowering, SuperDSC generation, and DeepTools compilation all happen
+  on the first invocation. The second call with the same shapes skips
+  everything and just runs the cached binaries.
+
+---
+
+*This concludes the core education guide. For further exploration, see
+the linked documentation in each chapter's "Dive deeper" section, or
+the skills in `.claude/skills/` for task-specific guidance.*
