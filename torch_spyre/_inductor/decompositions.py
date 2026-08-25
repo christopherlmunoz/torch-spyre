@@ -107,7 +107,7 @@ def register_spyre_decompositions(ops: OpOrOps):
     ``_register_spyre_dispatchkey_kernels_permanently`` additionally installs a
     PrivateUse1 kernel pointing at the same function at runtime init, so
     eager-mode dispatch reaches it too. This is required for
-    ``CompositeImplicitAutograd`` ops (``rms_norm``, ``layer_norm``, ``batch_norm`` ...); it
+    ``CompositeImplicitAutograd`` ops (``rms_norm``, ``layer_norm``, ``batch_norm``, ...); it
     is harmless for the rest.
     """
     return decomp.register_decomposition(ops, spyre_decompositions)

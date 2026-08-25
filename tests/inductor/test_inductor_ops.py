@@ -2804,6 +2804,15 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     torch.ones((256,), dtype=torch.float16),
                     torch.zeros((256,), dtype=torch.float16),
                 ),
+                "nontrivial_stats": (
+                    cached_randn((64, 256), dtype=torch.float16),
+                    cached_randn((256,), dtype=torch.float16, differentiation=1),
+                    cached_randn(
+                        (256,), dtype=torch.float16, differentiation=2, abs=True
+                    ),
+                    cached_randn((256,), dtype=torch.float16, differentiation=3),
+                    cached_randn((256,), dtype=torch.float16, differentiation=4),
+                ),
             },
         },
         # TODO: TorchInductor compilation failure in the Spyre lowering pass —
