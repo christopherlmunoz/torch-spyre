@@ -2809,3 +2809,46 @@ def spyre_index_add(
     updated = gathered + source
     indices: list[Optional[torch.Tensor]] = [None] * dim + [index]
     return torch.index_put(self, indices, updated, accumulate=False)
+
+@register_spyre_decompositions([torch.ops.aten.histc.default])
+def spyre_histc(
+    input: torch.Tensor,
+    bins: int = 100,
+    min: float = 0,
+    max: float = 0,
+) -> torch.Tensor:
+    if min == max:
+        raise Unsupported(
+            f"spyre_histc: automatic range (min == max) is not supported, "
+            f"pass an explicit min/max, got min={min}, max={max}"
+        )
+    
+    # makes input 1d tensor 
+    input = input.reshape(-1)
+    # SAMV coordinate masking is 16-bit-only, so the fp32 reduction must
+    # never be ragged -- pad to a full 64-element stick with a binless value
+    pad_len = (64 - input.numel() % 64) % 64
+    if pad_len:
+        pad = torch.full(
+            (pad_len,), float("-inf"), dtype=input.dtype, device=input.device
+        )
+        input = torch.cat((input, pad))
+
+
+    width = (max - min) / bins
+    counts = []
+    for idx in range(bins):
+        lo = min + idx * width
+        if idx == bins - 1:
+            mask = (input >= lo) & (input <= max)
+        else:
+            mask = (input >= lo) & (input < lo + width)
+        counts.append(mask.to(torch.float32).sum())
+    return counts[0]
+    #return torch.stack(counts).to(input.dtype)
+
+    # fp16 2048 + 1 = 2048 
+
+    # for each x in input
+    #   idx = floor ( x - min / width)
+    #   hist [idx] += 1
