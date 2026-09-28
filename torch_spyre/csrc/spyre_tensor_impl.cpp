@@ -18,7 +18,9 @@
 
 #include <c10/core/DispatchKey.h>
 #include <c10/core/DispatchKeySet.h>
+#include <util/sendefs/dataType.h>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,15 +30,21 @@
 
 namespace spyre {
 
-#define BYTES_IN_STICK 128
-
 int64_t elems_per_stick(const DataFormats& df) {
   // TODO(dgrove-oss): DeepTools dataFormatToStickSize map is incomplete!
-  if (df == DataFormats::IEEE_INT32) {
-    return 32;
+  auto it = dataFormatToStickSize.find(df);
+  if (it != dataFormatToStickSize.end() && it->second > 0) {
+    return static_cast<int64_t>(it->second);
   }
-  auto fp_elems = dataFormatToStickSize[df];
-  return static_cast<int64_t>(fp_elems);
+  // DCI already accepts these storage formats, missing from the map above.
+  // Complete their geometry without enabling unmapped compute formats.
+  if (df == DataFormats::IEEE_INT32 || df == DataFormats::IEEE_INT64 ||
+      df == DataFormats::BOOL || df == DataFormats::BFLOAT16) {
+    return getNumElemsInStick(df);
+  }
+  // Capability queries use zero for unsupported geometry; storage sizing below
+  // rejects it rather than allocating an unknown format.
+  return 0;
 }
 
 /* Returns default tiling of tensor dimensions on the device.
@@ -118,12 +126,10 @@ static std::vector<int64_t> dim_map_to_stride_map(
     int32_t d = dim_map[j];
     if (d == -1 || host_size[d] == 1) {
       stride_map[j] = -1;
-    } else if (last_stride[d] == -1) {
-      stride_map[j] = host_stride[d];
-      last_stride[d] = stride_map[j] * device_size[j];
     } else {
-      stride_map[j] = last_stride[d];
-      last_stride[d] = stride_map[j] * device_size[j];
+      stride_map[j] = last_stride[d] == -1 ? host_stride[d] : last_stride[d];
+      last_stride[d] = std::min(stride_map[j] * device_size[j],
+                                host_stride[d] * host_size[d]);
     }
   }
   return stride_map;
@@ -141,6 +147,8 @@ void SpyreTensorLayout::init(std::vector<int64_t> host_size,
                              std::vector<int64_t> host_strides,
                              c10::ScalarType dtype,
                              std::vector<int32_t> dim_order) {
+  TORCH_CHECK(host_size.size() == host_strides.size(),
+              "Incompatible host_size and host_strides");
   TORCH_CHECK((host_size.size() == dim_order.size()) ||
                   (((host_size.size() + 1) == dim_order.size()) &&
                    dim_order.back() == -1),
@@ -295,10 +303,24 @@ void SpyreTensorImpl::shallow_copy_from(
   this->spyre_layout = spyre_impl->spyre_layout;
 }
 
-uint64_t get_device_size_in_bytes(SpyreTensorLayout stl) {
-  uint64_t size_bytes = BYTES_IN_STICK;
-  for (int i = stl.device_size.size() - 2; i >= 0; i--) {
-    size_bytes *= stl.device_size[i];
+uint64_t get_device_size_in_bytes(const SpyreTensorLayout& stl) {
+  return get_device_size_in_bytes(stl.device_size, stl.device_dtype);
+}
+
+uint64_t get_device_size_in_bytes(const std::vector<int64_t>& device_size,
+                                  const DataFormats& device_dtype) {
+  // Size complete device sticks, including padding and sparse positions. The
+  // trailing extent may expose fewer values, but does not shorten a stick.
+  // A compute format without storage geometry must not be sized by bit width.
+  const auto elems = elems_per_stick(device_dtype);
+  TORCH_CHECK(elems > 0, "No device stick geometry for data format ",
+              static_cast<int>(device_dtype));
+  const auto bits = getSizeInBits(device_dtype);
+  TORCH_CHECK(bits > 0, "No device element width for data format ",
+              static_cast<int>(device_dtype));
+  uint64_t size_bytes = (elems * bits + 7) / 8;
+  for (int i = static_cast<int>(device_size.size()) - 2; i >= 0; i--) {
+    size_bytes *= device_size[i];
   }
   return size_bytes;
 }
@@ -325,6 +347,24 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
                 "Error: Attempting to set a STL for a device tensor that does "
                 "not have SpyreTensorImpl");
   }
+}
+
+std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.is_privateuseone());
+  SpyreTensorImpl* impl;
+  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
+    return impl->dma_sizes;
+  }
+  TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
+}
+
+std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor) {
+  TORCH_CHECK(tensor.is_privateuseone());
+  SpyreTensorImpl* impl;
+  if (impl = dynamic_cast<SpyreTensorImpl*>(tensor.unsafeGetTensorImpl())) {
+    return impl->dma_strides;
+  }
+  TORCH_CHECK(false, "Error: Device tensor does not have SpyreTensorImpl");
 }
 
 };  // namespace spyre
