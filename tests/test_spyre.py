@@ -14,6 +14,7 @@
 
 # Owner(s): ["module: cpp"]
 
+import functools
 import os
 import warnings
 from contextlib import contextmanager
@@ -44,14 +45,42 @@ _SCALAR_ROUNDTRIP_DTYPE_CASES = [
     (torch.float32, lambda fn: fn((), dtype=torch.float32)),
 ]
 
-# TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1153 (to_dtype / Inductor)
+# The add is correct, but int8 goes through a CPU fallback for the conversion to
+# float32, which warns, and the helper asserts no warning (#5364).
 _SCALAR_ADD_XFAIL_TO_DTYPE = pytest.mark.xfail(
-    reason="Support scalar eager add with to_dtype lowering in Spyre"
+    strict=True,
+    raises=AssertionError,
+    reason="the int8 to float32 conversion falls back to the CPU and warns, "
+    "and the test asserts no warning (#5364)",
 )
+
+
+# A float16-format bool's float32 or integer result is staggered on device.
+_EAGER_BOOL_READBACK_XFAIL = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="a staggered result is read back without restoring its order (#4393)",
+)
+
+
+def _expect_raise(match):
+    """Decorator: the test passes only if it raises with a message matching ``match``."""
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with pytest.raises(Exception, match=match):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1474 (DataFormats.SEN143_FP8)
-_SCALAR_ADD_XFAIL_FP8 = pytest.mark.xfail(
-    reason="Support scalar eager add for DataFormats.SEN143_FP8 in Spyre"
-)
+# A missing feature, not a design limit: scalar eager add is rejected for SEN143_FP8
+# today; when #1474 lands this fails and the case has to go back to a normal one.
+_SCALAR_ADD_RAISES_FP8 = _expect_raise(r"add on DataFormats\.SEN143_FP8")
 # TODO: ISSUE: https://github.com/torch-spyre/torch-spyre/issues/925
 _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
     reason="Spyre backend does not support int32/int16 dtype - causes segfault/crash in data format converter"
@@ -59,7 +88,7 @@ _SCALAR_ADD_SKIP_INT = pytest.mark.skip(
 
 # TODO:ISSUE: https://github.com/torch-spyre/torch-spyre/issues/1588
 _SCALAR_ADD_SKIP_UINT8 = pytest.mark.skip(
-    reason="Spyre hardware requires 128-byte aligned buffers - small uint8 tensors cause alignment violations"
+    reason="uint8 host transfers unsupported: host format SENUINT32 is 4 bytes, PyTorch stores 1 (#1588)"
 )
 
 _SCALAR_ADD_FALLBACK_FULL_WARN = r"torch\.ops\.spyre\.full is falling back to cpu"
@@ -74,7 +103,6 @@ class TestSpyre(TestCase):
     def test_initializes(self):
         self.assertEqual(torch._C._get_privateuse1_backend_name(), "spyre")
 
-    @pytest.mark.xfail(reason="autograd not yet supported", strict=True)
     def test_autograd_init(self):
         # Make sure autograd is initialized
         torch.ones(2, requires_grad=True, device="spyre").sum().backward()
@@ -90,7 +118,7 @@ class TestSpyre(TestCase):
                 thread_name = file.read().strip()
             all_thread_names.add(thread_name)
 
-        for i in range(torch.spyre._device_daemon.NUM_DEVICES):
+        for i in range(torch.spyre.device_count()):
             self.assertIn(f"pt_autograd_{i}", all_thread_names)
 
     def test_empty_factory(self):
@@ -282,7 +310,7 @@ class TestSpyre(TestCase):
             )
             self._assert_zero_dim_roundtrip(x, x_cpu, dtype)
 
-    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8/bool/int64: Inductor to_dtype in add (#1153).
+    # Scalar 0-dim: spyre -> add(2.) -> cpu. int8: the conversion to float32 warns (#5364).
     # float8: SEN143_FP8 unsupported. float16/float32: pass; ignore known full() CPU fallback warn.
     @parametrize(
         "dtype, scalar_factory, ignored_warning_message",
@@ -295,7 +323,6 @@ class TestSpyre(TestCase):
             subtest(
                 (torch.bool, lambda: torch.tensor(True, dtype=torch.bool), None),
                 name="bool",
-                decorators=[_SCALAR_ADD_XFAIL_TO_DTYPE],
             ),
             subtest(
                 (torch.int64, lambda: torch.tensor(10, dtype=torch.int64), None),
@@ -325,7 +352,7 @@ class TestSpyre(TestCase):
                     None,
                 ),
                 name="float8_e4m3fn",
-                decorators=[_SCALAR_ADD_XFAIL_FP8],
+                decorators=[_SCALAR_ADD_RAISES_FP8],
             ),
             subtest(
                 (
@@ -382,6 +409,30 @@ class TestSpyre(TestCase):
             )
             self._assert_roundtrip_close(x, x_cpu, dtype)
 
+    @parametrize(
+        "dtype",
+        [
+            subtest(
+                dtype,
+                name=str(dtype).removeprefix("torch."),
+                decorators=[_EAGER_BOOL_READBACK_XFAIL],
+            )
+            for dtype in (torch.float32, torch.int32, torch.int64)
+        ],
+    )
+    def test_eager_bool_to_dtype_readback(self, dtype):
+        # An eager bool converts on device, and the result is read back directly.
+        mask = ((torch.arange(4 * 128) % 3) == 0).reshape(4, 128)
+        out = mask.to("spyre").to(dtype).cpu()
+        torch.testing.assert_close(out, mask.to(dtype), atol=0, rtol=0)
+
+    def test_eager_bool_to_float32_consumed(self):
+        # Converting the float32 back to float16 on device restores the order.
+        mask = ((torch.arange(4 * 128) % 3) == 0).reshape(4, 128)
+        out = (mask.to("spyre").to(torch.float32) * 2).to(torch.float16).cpu()
+        expected = (mask.to(torch.float32) * 2).to(torch.float16)
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+
     def test_cross_device_inplace_error_msg(self):
         # Mirrors upstream test_cross_device_inplace_error_msg: the CPU tensor is the write target, so it must raise despite the scalar exemption below.
         a = torch.tensor(2.0)
@@ -412,7 +463,11 @@ class TestSpyre(TestCase):
         ):
             spyre_t + cpu_t
 
-    @pytest.mark.xfail(reason="data-dependent output not supported", strict=True)
+    @pytest.mark.xfail(
+        raises=NotImplementedError,
+        reason="data-dependent output not supported (no aten::masked_select)",
+        strict=True,
+    )
     def test_data_dependent_output(self):
         cpu_a = torch.randn(10)
         a = cpu_a.to(device="spyre")
@@ -730,6 +785,50 @@ class TestSpyre(TestCase):
         scalar = torch.tensor(3.14, dtype=torch.float16, device="spyre")
         assert scalar.dim() == 0
 
+    def test_uint8_transfer_rejected_not_card_fault(self):
+        """uint8 host transfers raise a clean error in both directions."""
+        # D2H: the direction that faulted on an unfixed build.
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
+            torch.empty(272, dtype=torch.uint8, device="spyre").cpu()
+        # H2D: refused by this gate too, so a wrong host format cannot reach
+        # the card in either direction.
+        with self.assertRaisesRegex(RuntimeError, "does not support dtype"):
+            torch.ones(272, dtype=torch.uint8).to("spyre")
+
+    def test_uint8_allocation_still_allowed(self):
+        """Allocating a uint8 tensor on device must keep working.
+
+        Only the host transfer is refused.  torch.distributed allocates uint8
+        tensors internally (distributed_c10d.py, used by barrier() and the
+        object collectives), so gating is_supported_dtype() on this would
+        break the multi-Spyre barrier tests.
+        """
+        t = torch.empty(272, dtype=torch.uint8, device="spyre")
+        self.assertEqual(t.device.type, "spyre")
+        self.assertEqual(t.dtype, torch.uint8)
+
+    def test_supported_dtypes_still_transferable(self):
+        """The width gate must not reject dtypes whose host width matches.
+
+        int16 is excluded because isDCIConversionSupported has no
+        {SENINT16, SENINT16} pair, so its H2D fails on the conversion check
+        rather than on this gate.
+        """
+        for dtype in (
+            torch.int8,
+            torch.int32,
+            torch.int64,
+            torch.bool,
+            torch.float16,
+            torch.float32,
+            torch.bfloat16,
+        ):
+            with self.subTest(dtype=dtype):
+                cpu = torch.ones(128, dtype=dtype)
+                dev = cpu.to("spyre")
+                self.assertEqual(dev.device.type, "spyre")
+                self.assertEqual(dev.cpu().dtype, dtype)
+
     def test_d2h_h2d_dtype_conversion(self):
         """Test H2D (CPU -> Spyre) and D2H (Spyre -> CPU) dtype conversions.
 
@@ -773,10 +872,13 @@ class TestSpyre(TestCase):
             (torch.float32, torch.float16),
         }
 
-        # DCI doesn't support either direction for these conversions.
+        # DCI doesn't support either direction for these conversions. int64 is
+        # IEEE_INT32 on device, so it shares int32's gap.
         skip_eager_conversions = {
             (torch.float32, torch.int32),
             (torch.int32, torch.float32),
+            (torch.float32, torch.int64),
+            (torch.int64, torch.float32),
         }
 
         # Test supported conversions
@@ -906,12 +1008,13 @@ class TestSpyre(TestCase):
         from torch_spyre._C import ElementArrangement, get_spyre_tensor_layout
         from torch_spyre.ops.fallbacks import FallbackWarning
 
-        source_cpu = torch.arange(128, dtype=torch.int32).reshape(2, 64)
+        # int8 has a device format but no conversion op.
+        source_cpu = (torch.arange(128) % 100).to(torch.int8).reshape(2, 64)
         source = source_cpu.to("spyre")
 
         with self.assertWarnsRegex(
             FallbackWarning,
-            r"conversion from torch\.int32 to torch\.float16 is falling back to cpu",
+            r"conversion from torch\.int8 to torch\.float16 is falling back to cpu",
         ):
             actual = source.to(torch.float16)
 
@@ -1019,6 +1122,27 @@ class TestSpyre(TestCase):
         )
         x[3, 3, 3] = y
         self.assertEqual(x.cpu()[3, 3, 3], y, atol=1e-3, rtol=1e-3)
+
+    @parametrize(
+        "sizes",
+        [
+            [4, 8, 16, 60],
+            [8, 10, 30, 64],
+            [9, 15, 35, 100],
+        ],
+    )
+    @pytest.mark.xfail(
+        strict=False,  # Allows XPASS for now, will be changed to True to enforce later
+        raises=AssertionError,
+        reason="Sub-stick slices are not yet supported for DMA",
+    )
+    def test_h2d_copy_to_substick_sliced_destination(self, sizes):
+        """H2D sub-stick tensor slice"""
+        x = torch.rand(
+            sizes,
+            dtype=torch.float16,
+            device="spyre",
+        )
 
         slice_sizes = [2]
         y = torch.rand(

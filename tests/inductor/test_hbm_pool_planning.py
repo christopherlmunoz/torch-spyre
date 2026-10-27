@@ -17,6 +17,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from unittest.mock import patch as mock_patch
 
+import pytest
 import regex as re
 import torch
 from sympy import Integer
@@ -33,14 +34,13 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 from torch._inductor.virtualized import V
 from torch.utils._ordered_set import OrderedSet
-import pytest
+from utils_inductor import mock_backend_compiler
 
 from torch_spyre._C import ElementArrangement, SpyreTensorLayout
 from torch_spyre._inductor import config
 from torch_spyre._inductor.hbm_pool_planning import Allocator, hbm_pool_planning
 from torch_spyre._inductor.ir import FixedTiledLayout
 from torch_spyre._inductor.scheduler import CountedLoopSchedulerNode
-from utils_inductor import mock_backend_compiler
 
 # Paths to mock for disabling actual device kernel execution.
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
@@ -771,7 +771,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"{seen_pool_sizes}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_pool_alloc_scoped_per_bundle_across_fallback_boundary(self):
         """A CPU-fallback op (torch.tril) splits the graph into multiple
@@ -854,7 +854,7 @@ class TestHbmPoolPlanningE2E(InductorTestCase):
             f"kernels were {kernel_names}",
         )
 
-    @config.patch({"lx_planning": False})
+    @config.patch({"lx_planning": False, "frontend_pool_allocation": False})
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_no_python_side_pool_tensor_allocated(self):
         """With frontend_pool_allocation at its default (False), no bundle

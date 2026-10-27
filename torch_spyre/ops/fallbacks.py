@@ -53,16 +53,11 @@ from torch._ops import OpOverload, OpOverloadPacket
 
 from typing import Union
 
+from .warning_types import FallbackWarning
+
 aten = torch._ops.ops.aten
 
 fallback_ops = list()
-
-
-class FallbackWarning(UserWarning):
-    """
-    Warning issued when an operator runs on a fallback device (e.g., CPU)
-    instead of Spyre
-    """
 
 
 warnings.simplefilter("once", FallbackWarning)
@@ -251,7 +246,6 @@ register_fallback_default(
         aten.argmax.default,
         aten.argmin.default,
         aten.where.default,
-        aten.index_copy.out,
     ]
 )
 
