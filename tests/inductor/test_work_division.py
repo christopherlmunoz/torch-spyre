@@ -2240,6 +2240,23 @@ class TestQfp8wtConstraints(unittest.TestCase):
         for v in restricted_vars:
             self.assertEqual(result.allowed_splits[v], frozenset({1}))
 
+    def test_all_dims_restricted_for_batched_qfp8wt_output(self):
+        b, h, k, n = _isym("b"), _isym("h"), _isym("k"), _isym("n")
+        op = _computed_buffer((2, 12, 128, 128), name="qfp8_out_4d")
+        output_td = _tensor_dep(
+            "qfp8_out_4d",
+            (2, 12, 128, 128),
+            (b, h, k, n),
+            element_arrangement=ElementArrangement.QFP8WT,
+        )
+        ctx = _make_context(op, output_td, it_space={b: 2, h: 12, k: 128, n: 128})
+        result = qfp8wt_split_domains(ctx)
+        # A QFP8WT tensor with batch dims is not split along any dim.
+        self.assertEqual(
+            result.allowed_splits,
+            {v: frozenset({1}) for v in (b, h, k, n)},
+        )
+
     def test_standard_output_yields_no_pins(self):
         b, m, n = _isym("b"), _isym("m"), _isym("n")
         op = _computed_buffer((4, 8, 128), name="std_out")
@@ -4675,3 +4692,24 @@ class TestResidencyRuleRegistry(unittest.TestCase):
         self.assertEqual(body, residency_rules_markdown())
         self.assertIn("| Why |", body)
         self.assertTrue(all(rule.why.strip() for rule in BUFFER_RESIDENCY_RULES))
+
+    def test_transfer_certificate_references_resolve(self):
+        import ast
+        from pkgutil import resolve_name
+        from pathlib import Path
+        from torch_spyre._inductor.scratchpad.residency_rules import (
+            TRANSFER_CERTIFICATES,
+        )
+
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual(
+            len({row.name for row in TRANSFER_CERTIFICATES}), len(TRANSFER_CERTIFICATES)
+        )
+        for row in TRANSFER_CERTIFICATES:
+            self.assertTrue(callable(resolve_name(row.certificate)))
+            for test in row.predicate_tests + row.integration_tests:
+                filename, name = test.split("::")
+                tree = ast.parse((root / "tests/inductor" / filename).read_text())
+                self.assertIn(
+                    name, {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+                )
