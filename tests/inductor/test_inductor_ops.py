@@ -10887,7 +10887,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
 
         self.compare_with_cpu(fn, x, weight)
 
-    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    @pytest.mark.filterwarnings("error::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_batch_norm_functional_cpu(
         self, x, running_mean, running_var, weight, bias
     ):

@@ -16,9 +16,11 @@ import pytest
 import unittest
 import torch
 
+from torch_spyre._inductor.errors import Unsupported
 from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
+    expects_raise,
 )
 from utils_inductor import compare_with_cpu
 
@@ -334,7 +336,7 @@ class <lambda>(torch.nn.Module):
         """aten.batch_norm must be fully decomposed before Inductor lowering.
 
         Spyre has no batch_norm kernel or lowering; the compiled path relies on
-        the upstream decomposition rewriting it into suported pointwise ops.
+        the upstream decomposition rewriting it into supported pointwise ops.
         Assert the invariant (no batch_norm variant reaches the Inductor graph)
         without pinning the exact upstream op sequence, which can change with
         PyTorch versions.
@@ -380,6 +382,21 @@ class <lambda>(torch.nn.Module):
             "aten.batch_norm was not decomposed before Inductor lowering:\n"
             f"{inductor_graph_str}"
         )
+
+    @expects_raise
+    def test_batch_norm_training_eager_raises(self):
+        """Eager batch_norm with training=True is rejected by spyre_batch_norm.
+
+        Eager only: under torch.compile, training=True fails earlier in Inductor
+        and never reaches this check.
+        """
+        # TODO: a missing feature, not a design limit. When batch statistics are
+        # supported this stops raising, and the test has to become a positive one.
+        x = cached_randn((64, 256)).to("spyre")
+        rm = cached_randn((256,), differentiation=1).to("spyre")
+        rv = cached_randn((256,), differentiation=2, abs=True).to("spyre")
+        with pytest.raises(Unsupported, match="training mode is not supported"):
+            torch.nn.functional.batch_norm(x, rm, rv, training=True)
 
     def test_bool_amax_amin(self):
         """Test amax/amin on boolean tensors"""

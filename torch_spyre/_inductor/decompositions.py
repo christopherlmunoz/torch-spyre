@@ -1822,7 +1822,7 @@ def spyre_batch_norm(
     if training:
         raise Unsupported(
             "spyre_batch_norm: training mode is not supported on "
-            "infrence-only Spyre backend."
+            "inference-only Spyre backend."
         )
     # native_batch_norm returns (output, save_mean, save_invstd).
     # The batch_norm schema returns only the output.
